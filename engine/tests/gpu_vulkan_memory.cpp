@@ -36,6 +36,9 @@ int main(int argc, char** argv) {
     auto live = gpu->alloc_zeroed(4096, error);
     auto persistent = gpu->alloc_persistent(4096, error);
     if (!require(bool(live) && bool(persistent), error.c_str())) return 1;
+    // Upstream retains reusable planes between frames; explicit export/cache
+    // cleanup owns reclamation, rather than making every edit reallocate.
+    gpu->trim_pool(0);
     gpu->begin_frame();
     if (!require(gpu->pool_stats().free_bytes == 0 && gpu->pool_stats().live_bytes == 4096 &&
                  gpu->pool_stats().persistent_bytes == 4096,
@@ -46,6 +49,7 @@ int main(int argc, char** argv) {
     live.reset();
     persistent.reset();
     gpu->end_frame();
+    gpu->trim_pool(0);
     if (!require(gpu->pool_stats().total_bytes == 0, "end_frame retained dead render planes")) return 1;
 
     auto idle = gpu->alloc(40 * MiB, error);
@@ -69,6 +73,7 @@ int main(int argc, char** argv) {
     if (!require(bool(recovered), "backend could not recover after releasing pressure")) return 1;
     recovered.reset();
     gpu->end_frame();
+    gpu->trim_pool(0);
     std::puts("memory: bounded reuse, pre/post-render cleanup, reclaim/retry, safe refusal and recovery passed");
     return 0;
 }

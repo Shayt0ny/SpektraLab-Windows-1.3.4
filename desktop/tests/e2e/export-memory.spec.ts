@@ -15,13 +15,14 @@ test('a lost display context shows a message and restores the displayed frame', 
   await expect(page.locator('.canvas-message')).toContainText('Display connection lost');
   await page.evaluate(() => (window as unknown as { restoreDisplay: () => void }).restoreDisplay());
   await expect(page.locator('.canvas-message')).toHaveCount(0, { timeout: 20000 });
-  expect(await page.locator('.canvas-gl').evaluate((node) => {
+  await expect.poll(() => page.locator('.canvas-gl').evaluate((node) => {
     const gl = (node as HTMLCanvasElement).getContext('webgl2')!;
-    const px = new Uint8Array(4);
+    const type = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE) as number;
+    const px = type === gl.FLOAT ? new Float32Array(4) : type === gl.HALF_FLOAT ? new Uint16Array(4) : new Uint8Array(4);
     gl.readPixels(Math.floor(gl.drawingBufferWidth / 2), Math.floor(gl.drawingBufferHeight / 2), 1, 1,
-      gl.RGBA, gl.UNSIGNED_BYTE, px);
-    return !gl.isContextLost() && px[3] === 255 && px[0]! + px[1]! + px[2]! > 0;
-  })).toBe(true);
+      gl.RGBA, type, px);
+    return { error: gl.getError(), type, pixels: Array.from(px), valid: !gl.isContextLost() && px[3] === (type === gl.FLOAT ? 1 : type === gl.HALF_FLOAT ? 0x3c00 : 255) && px[0]! + px[1]! + px[2]! > 0 };
+  })).toMatchObject({ error: 0, valid: true });
 });
 
 test('a real worker processes a 73 MP edited export while the interface keeps ticking', async ({ page }) => {

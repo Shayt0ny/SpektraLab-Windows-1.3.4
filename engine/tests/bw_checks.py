@@ -79,6 +79,8 @@ def density(enc):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dylib", type=Path, default=None)
+    ap.add_argument("--resources", type=Path, default=None,
+                    help="staged resources with product profiles and backend shaders (avoids symlinks on Windows)")
     a = ap.parse_args()
     grades = json.loads((ENGINE / "resources_product" / "paper_grades.json").read_text())["grades"]
     pack = lambda g, film: {"film_stock": film, "c_filter_neutral": 0.0, **grades[g]}
@@ -89,7 +91,7 @@ def main():
         print(("PASS " if ok else "FAIL ") + what + (" -- " + detail if detail else ""))
         fails += 0 if ok else 1
 
-    with tempfile.TemporaryDirectory() as tmp, spk.Engine(dylib=a.dylib, resources=overlay(tmp)) as e:
+    with tempfile.TemporaryDirectory() as tmp, spk.Engine(dylib=a.dylib, resources=a.resources or overlay(tmp)) as e:
         for film in FILMS:
             names = list(PATCHES)
             base = cells(render(e, chart(), pack("2", film)), len(names))

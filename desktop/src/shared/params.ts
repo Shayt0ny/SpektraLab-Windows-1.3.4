@@ -11,6 +11,9 @@
 // The JSON keys of `FilmParams` are the Swift `Codable` keys, so a sidecar
 // written by the macOS app opens here and the other way round.
 
+import type { StockCatalog } from './stocks.ts';
+import { dateCamera, dateEffective, datePrints, dateScale, edgeEffective, filmFormatForWire } from './filmEdge.ts';
+
 export type ParamLayer = 'shoot' | 'print';
 export type WireValue = number | boolean | string;
 export interface WireField {
@@ -117,12 +120,6 @@ export interface SceneLatitudeSettings {
   rolloff: number;
   maxLift: number;
 }
-
-/** Upstream 1.3.3 measured stock grain at a displayed strength of one. */
-export function ownGrain(stock: string): number {
-  return ({ kodak_tri_x_400: 1.70, ilford_hp5_plus_400: 1.49, kodak_tmax_100: 0.74,
-    fujifilm_neopan_acros_100_ii: 0.64 } as Record<string, number>)[stock] ?? 1;
-}
 export const SCENE_LATITUDE_DEFAULT: SceneLatitudeSettings = {
   highlightPullBack: 0,
   shadowPullBack: 0,
@@ -144,6 +141,8 @@ export interface EffectStrengths {
   halation: number;
   antihalationRemoved: boolean;
   highlightBoost: number;
+  /** `halation_headroom_ev` (1.3.4): the stops a clipped highlight is given back, on a film with no
+   * anti-halation layer (CineStill 800T) only; every other film ignores it. 0…8 EV, 4 the engine default. */
   highlightHeadroom: number;
   scatter: number;
   couplersActive: boolean;
@@ -294,13 +293,6 @@ export interface FilmParams {
   printEffects: boolean;
   filmEdge: FilmEdgeSettings;
   dateBack: DateBackSettings;
-  /**
-   * The enlarger's pack sent as the neutral (C, M, Y), derived per render and
-   * never stored: Multigrade filter 2 for black and white on its paper
-   * (`FilmParams.multigradeFilter2`), because the engine's table has no row
-   * for a silver paper.
-   */
-  neutralPack?: [number, number, number] | null;
 }
 
 export const FILM_PARAMS_DEFAULT: FilmParams = {
@@ -392,6 +384,8 @@ export function decodeFilmParams(raw: unknown): FilmParams {
 
 /** Features the host may refuse (`capabilities.backend.unsupported_features`). */
 export interface FeatureGate {
+  /** Decoded source through Layer 2, explicitly advertised by the host. */
+  noFilm: boolean;
   digitalIntermediate: boolean;
   sceneLatitude: boolean;
   contrastMask: boolean;
@@ -403,6 +397,7 @@ export interface FeatureGate {
   toneMask: boolean;
 }
 export const ALL_FEATURES: FeatureGate = {
+  noFilm: true,
   digitalIntermediate: true,
   sceneLatitude: true,
   contrastMask: true,
@@ -412,9 +407,10 @@ export const ALL_FEATURES: FeatureGate = {
   toneMask: false,
 };
 
-export function featureGate(unsupported: readonly string[] | undefined, diBlue = false): FeatureGate {
+export function featureGate(unsupported: readonly string[] | undefined, diBlue = false, noFilm = false): FeatureGate {
   const u = new Set(unsupported ?? []);
   return {
+    noFilm,
     digitalIntermediate: !u.has('digital_intermediate'),
     sceneLatitude: !u.has('scene_latitude_mapping'),
     contrastMask: !u.has('contrast_mask'),
@@ -425,8 +421,36 @@ export function featureGate(unsupported: readonly string[] | undefined, diBlue =
   };
 }
 
-export function effectiveEDR(p: FilmParams): boolean {
-  return p.extendedDynamicRange && !p.scanFilm && !p.digitalIntermediate;
+export function effectiveEDR(p: FilmParams, catalog?: StockCatalog): boolean {
+  return p.extendedDynamicRange && !p.scanFilm && !p.digitalIntermediate && !catalog?.isMonochrome(p.printStock);
+}
+
+/** Repair viewing-stage/paper compatibility at every editor and batch entry.
+ * Saved preferences (EDR, layered grain, exposure and direct scan) survive;
+ * their effective values are derived only when the wire is built. */
+export function normalizeStockPair(p: FilmParams, catalog: StockCatalog): FilmParams {
+  const scanFilm = p.scanFilm || catalog.isPositive(p.filmStock);
+  let printStock = p.printStock;
+  if (!catalog.canPrint(p.filmStock, printStock)) {
+    const target = catalog.stock(p.filmStock)?.targetPrint;
+    const defaultPaper = FILM_PARAMS_DEFAULT.printStock;
+    const replacement = target && catalog.stock(target) && catalog.canPrint(p.filmStock, target)
+      ? target : catalog.stock(defaultPaper) && catalog.canPrint(p.filmStock, defaultPaper)
+        ? defaultPaper : catalog.papers.find((paper) => catalog.canPrint(p.filmStock, paper.id))?.id;
+    if (replacement) printStock = replacement;
+  }
+  return scanFilm === p.scanFilm && printStock === p.printStock ? p : { ...p, scanFilm, printStock };
+}
+
+/** Upstream 1.3.3's per-film RMS grain calibration; the UI strength multiplies it. */
+export function ownGrain(stock: string): number {
+  switch (stock) {
+    case 'kodak_tri_x_400': return 1.70;
+    case 'ilford_hp5_plus_400': return 1.49;
+    case 'kodak_tmax_100': return 0.74;
+    case 'fujifilm_neopan_acros_100_ii': return 0.64;
+    default: return 1;
+  }
 }
 
 export function digitalIntermediateActive(p: FilmParams, filmIsPositive: boolean): boolean {
@@ -439,67 +463,7 @@ export function digitalIntermediateActive(p: FilmParams, filmIsPositive: boolean
  * from the Mac never makes the host refuse the whole delta; the setting itself
  * stays in the sidecar.
  */
-/**
- * The crop the engine's frame is cut with (`io.geometry`), or null for the
- * whole decode. Structurally `Geometry`'s fields (geometry.ts imports this
- * module, so it is not imported back).
- */
-export interface EngineCut {
-  crop: { x: number; y: number; width: number; height: number };
-  angle: number;
-  quarterTurns: number;
-  flipH: boolean;
-  flipV: boolean;
-}
-
-/** The film's gate per format, mm, along x across for the camera held level
- * (Model/FilmEdge.swift `gateMM`, the engine's table in overscan.cpp). */
-export const FILM_EDGE_GATE_MM: Record<string, [number, number]> = {
-  '135': [36, 24],
-  '135_half': [24, 18],
-  '120_645': [56, 41.5],
-  '120_6x6': [56, 56],
-  '120_6x7': [69.5, 56],
-  '120_6x8': [76, 56],
-  '120_6x9': [84, 56],
-  '135_xpan': [65, 24],
-  '120_6x12': [112, 56],
-  '120_6x17': [168, 56],
-};
-
-/** The gate's width / height for a crop of this orientation (Session+FilmEdge.swift `gateRatio`). */
-export function gateRatio(format: string, landscape: boolean): number {
-  const [long, short] = FILM_EDGE_GATE_MM[format] ?? [36, 24];
-  return landscape ? long / short : short / long;
-}
-
-export function filmEdgeOn(p: FilmParams, gate: FeatureGate = ALL_FEATURES): boolean {
-  return gate.overscan && p.filmEdge.active;
-}
-
-export function dateBackOn(p: FilmParams, gate: FeatureGate = ALL_FEATURES): boolean {
-  const d = p.dateBack;
-  return gate.dateImprint && d.active && (d.face === 'data' || d.placement === 'frame' || filmEdgeOn(p, gate));
-}
-
-function cutIsIdentity(g: EngineCut): boolean {
-  return (
-    g.crop.x === 0 && g.crop.y === 0 && g.crop.width === 1 && g.crop.height === 1 &&
-    g.angle === 0 && ((g.quarterTurns % 4) + 4) % 4 === 0 && !g.flipH && !g.flipV
-  );
-}
-
-/**
- * Whether the engine is handed the frame cut by the crop rather than the whole
- * decode (`FilmParams.cutsFrame` on the Mac): a film edge -- the gate is the
- * frame the engine gets, so the crop is part of the negative -- or the date
- * alone under a crop, a turn or a flip, so it lands in the picture's corner.
- */
-export function cutsFrame(p: FilmParams, gate: FeatureGate, g: EngineCut): boolean {
-  return filmEdgeOn(p, gate) || (dateBackOn(p, gate) && !cutIsIdentity(g));
-}
-
-export function wire(p: FilmParams, gate: FeatureGate = ALL_FEATURES, cut: EngineCut | null = null): WireField[] {
+export function wire(p: FilmParams, gate: FeatureGate = ALL_FEATURES, catalog?: StockCatalog): WireField[] {
   const di = gate.digitalIntermediate && p.digitalIntermediate;
   const placement = p.placementIsRight ? p.sceneLatitudeOther : p.sceneLatitude;
   const f: WireField[] = [
@@ -510,9 +474,9 @@ export function wire(p: FilmParams, gate: FeatureGate = ALL_FEATURES, cut: Engin
   if (p.autoExposureMethod != null) f.push({ name: 'auto_exposure_method', value: p.autoExposureMethod, layer: 'shoot' });
   f.push(
     { name: 'auto_exposure', value: p.autoExposure, layer: 'shoot' },
-    { name: 'film_format_mm', value: clamp(p.filmFormatMM, 4, 200), layer: 'shoot' },
+    { name: 'film_format_mm', value: clamp(filmFormatForWire(p, gate), 4, 200), layer: 'shoot' },
     { name: 'grain_active', value: p.grainActive, layer: 'shoot' },
-    { name: 'grain_sublayers_active', value: p.grainActive && p.effects.grainLayered, layer: 'shoot' },
+    { name: 'grain_sublayers_active', value: p.grainActive && p.effects.grainLayered && !catalog?.isMonochrome(p.filmStock), layer: 'shoot' },
     { name: 'halation_active', value: p.halationActive, layer: 'shoot' },
     { name: 'print_exposure', value: printExposure(p.printBrightnessStops), layer: 'print' },
     { name: 'y_filter_shift', value: clamp(p.yFilterShift, -1, 1), layer: 'print' },
@@ -520,16 +484,9 @@ export function wire(p: FilmParams, gate: FeatureGate = ALL_FEATURES, cut: Engin
     { name: 'filter_shift_scale', value: FILTER_SHIFT_CC, layer: 'print' },
     { name: 'glare_active', value: p.glareActive && p.printEffects, layer: 'print' },
     { name: 'scan_film', value: p.scanFilm, layer: 'print' },
-    { name: 'extended_dynamic_range', value: effectiveEDR(p), layer: 'print' },
+    { name: 'extended_dynamic_range', value: effectiveEDR(p, catalog), layer: 'print' },
     { name: 'preflash_exposure', value: p.printEffects ? clamp(p.preflashExposure, 0, 1) : 0, layer: 'print' },
   );
-  if (p.neutralPack) {
-    f.push(
-      { name: 'c_filter_neutral', value: p.neutralPack[0], layer: 'print' },
-      { name: 'm_filter_neutral', value: p.neutralPack[1], layer: 'print' },
-      { name: 'y_filter_neutral', value: p.neutralPack[2], layer: 'print' },
-    );
-  }
   if (gate.contrastMask) {
     f.push(
       {
@@ -558,7 +515,18 @@ export function wire(p: FilmParams, gate: FeatureGate = ALL_FEATURES, cut: Engin
       { name: 'scene_latitude_shadow_room', value: placement.shadowRoom, layer: 'shoot' },
       { name: 'scene_latitude_rolloff', value: placement.rolloff, layer: 'shoot' },
       { name: 'scene_latitude_max_lift', value: placement.maxLift, layer: 'shoot' },
+      { name: 'scene_latitude_split', value: p.filmEdge.pair ? clamp(p.pairSplit, 0, 1) : 0, layer: 'shoot' },
     );
+    if (p.filmEdge.pair) {
+      const second = p.placementIsRight ? p.sceneLatitude : p.sceneLatitudeOther;
+      f.push(
+        { name: 'scene_latitude_b_active', value: second.active && !(di && !p.scanFilm), layer: 'shoot' },
+        { name: 'scene_latitude_b_highlight_knee', value: second.highlightKnee, layer: 'shoot' },
+        { name: 'scene_latitude_b_highlight_room', value: second.highlightRoom, layer: 'shoot' },
+        { name: 'scene_latitude_b_shadow_knee', value: second.shadowKnee, layer: 'shoot' },
+        { name: 'scene_latitude_b_shadow_room', value: second.shadowRoom, layer: 'shoot' },
+      );
+    }
   }
   const e = p.effects;
   const r = EFFECT_RANGES;
@@ -571,8 +539,18 @@ export function wire(p: FilmParams, gate: FeatureGate = ALL_FEATURES, cut: Engin
     { name: 'glare_amount', value: clamp(e.glare, r.glare[0], r.glare[1]), layer: 'print' },
     { name: 'antihalation_removed', value: e.antihalationRemoved, layer: 'shoot' },
     { name: 'halation_boost_ev', value: clamp(e.highlightBoost, r.highlightBoost[0], r.highlightBoost[1]), layer: 'shoot' },
-    { name: 'halation_headroom_ev', value: clamp(e.highlightHeadroom, 0, 8), layer: 'shoot' },
+    // 1.3.4 (API-SPEC §18): sent always; every film with an anti-halation layer ignores it.
+    { name: 'halation_headroom_ev', value: clamp(e.highlightHeadroom, r.highlightHeadroom[0], r.highlightHeadroom[1]), layer: 'shoot' },
   );
+  if (catalog?.isMonochrome(p.filmStock) && catalog.isMonochrome(p.printStock)) {
+    // Multigrade IV RC filter 2. There is no silver-paper row in the colour
+    // neutral-filter database; sending no pack would retain the old colour pair.
+    f.push(
+      { name: 'c_filter_neutral', value: 0, layer: 'print' },
+      { name: 'm_filter_neutral', value: 0, layer: 'print' },
+      { name: 'y_filter_neutral', value: 68, layer: 'print' },
+    );
+  }
   if (gate.digitalIntermediate) {
     f.push(
       { name: 'digital_intermediate', value: p.digitalIntermediate, layer: 'print' },
@@ -585,8 +563,9 @@ export function wire(p: FilmParams, gate: FeatureGate = ALL_FEATURES, cut: Engin
   }
   if (gate.overscan) {
     const fe = p.filmEdge;
-    f.push({ name: 'overscan_active', value: fe.active, layer: 'shoot' });
-    if (fe.active) {
+    f.push({ name: 'overscan_active', value: edgeEffective(fe, gate), layer: 'shoot' });
+    f.push({ name: 'overscan_pair', value: fe.pair, layer: 'shoot' });
+    if (edgeEffective(fe, gate)) {
       f.push(
         { name: 'overscan_format', value: fe.format, layer: 'shoot' },
         { name: 'overscan_mode', value: fe.view, layer: 'shoot' },
@@ -599,13 +578,12 @@ export function wire(p: FilmParams, gate: FeatureGate = ALL_FEATURES, cut: Engin
         { name: 'overscan_leaks', value: clamp(fe.leaks, 0, 4), layer: 'shoot' },
         { name: 'overscan_edge_text', value: fe.edgeText, layer: 'shoot' },
         { name: 'overscan_f_number', value: clamp(fe.fNumber, 0, 64), layer: 'shoot' },
-        { name: 'overscan_pair', value: fe.pair, layer: 'shoot' },
       );
     }
   }
   if (gate.dateImprint) {
     const d = p.dateBack;
-    const on = dateBackOn(p, gate);
+    const on = dateEffective(d, p.filmEdge, gate), camera = dateCamera(d, p.filmEdge, gate), scale = dateScale(p, gate);
     f.push({ name: 'date_imprint_active', value: on, layer: 'shoot' });
     if (on) {
       if (!(gate.overscan && p.filmEdge.active))
@@ -613,38 +591,23 @@ export function wire(p: FilmParams, gate: FeatureGate = ALL_FEATURES, cut: Engin
       f.push(
         { name: 'date_imprint_style', value: d.face, layer: 'shoot' },
         { name: 'date_imprint_text', value: d.customText ?? d.text, layer: 'shoot' },
+        { name: 'date_imprint_text_b', value: p.filmEdge.pair ? d.textB : '', layer: 'shoot' },
         { name: 'date_imprint_placement', value: d.placement, layer: 'shoot' },
         { name: 'date_imprint_corner', value: d.corner, layer: 'shoot' },
-        { name: 'date_imprint_inset_x', value: clamp(d.insetXMM, 0, 30), layer: 'shoot' },
-        { name: 'date_imprint_inset_y', value: clamp(d.insetYMM, 0, 30), layer: 'shoot' },
-        { name: 'date_imprint_size', value: clamp(d.size, 0.4, 3), layer: 'shoot' },
+        { name: 'date_imprint_inset_x', value: clamp(d.insetXMM * scale, 0, 30), layer: 'shoot' },
+        { name: 'date_imprint_inset_y', value: clamp(d.insetYMM * scale, 0, 30), layer: 'shoot' },
+        { name: 'date_imprint_size', value: clamp((d.face === 'data' && camera?.id === '135_half' ? Math.min(d.size, 1) : d.size) * scale, 0.4, 3), layer: 'shoot' },
         { name: 'date_imprint_ev', value: clamp(d.brightnessEV, -2, 8), layer: 'shoot' },
-        { name: 'date_imprint_data_text', value: d.withData ? d.dataText : '', layer: 'shoot' },
-        { name: 'date_imprint_text_b', value: d.textB, layer: 'shoot' },
+        { name: 'date_imprint_data_text', value: d.withData && d.face !== 'data' && datePrints('data', d, p.filmEdge, gate) ? d.dataText : '', layer: 'shoot' },
       );
     }
-  }
-  if (gate.overscan || gate.dateImprint) {
-    // The crop in the negative while the frame is cut (`cutsFrame`), the
-    // identity otherwise: the canvas then applies it after the engine.
-    const g = cut ?? { crop: { x: 0, y: 0, width: 1, height: 1 }, angle: 0, quarterTurns: 0, flipH: false, flipV: false };
-    f.push(
-      { name: 'geometry_crop_x', value: clamp(g.crop.x, 0, 1), layer: 'shoot' },
-      { name: 'geometry_crop_y', value: clamp(g.crop.y, 0, 1), layer: 'shoot' },
-      { name: 'geometry_crop_w', value: clamp(g.crop.width, 1e-4, 1), layer: 'shoot' },
-      { name: 'geometry_crop_h', value: clamp(g.crop.height, 1e-4, 1), layer: 'shoot' },
-      { name: 'geometry_rotation_deg', value: clamp(g.angle, -45, 45), layer: 'shoot' },
-      { name: 'geometry_quarter_turns', value: ((Math.round(g.quarterTurns) % 4) + 4) % 4, layer: 'shoot' },
-      { name: 'geometry_flip_h', value: g.flipH, layer: 'shoot' },
-      { name: 'geometry_flip_v', value: g.flipV, layer: 'shoot' },
-    );
   }
   return f;
 }
 
-export function fullDelta(p: FilmParams, gate?: FeatureGate, cut: EngineCut | null = null): Record<string, WireValue> {
+export function fullDelta(p: FilmParams, gate?: FeatureGate, catalog?: StockCatalog): Record<string, WireValue> {
   const out: Record<string, WireValue> = {};
-  for (const f of wire(p, gate, cut)) out[f.name] = f.value;
+  for (const f of wire(p, gate, catalog)) out[f.name] = f.value;
   return out;
 }
 
@@ -653,13 +616,12 @@ export function delta(
   to: FilmParams,
   from: FilmParams,
   gate?: FeatureGate,
-  cutTo: EngineCut | null = null,
-  cutFrom: EngineCut | null = null,
+  catalog?: StockCatalog,
 ): { delta: Record<string, WireValue>; layers: Set<ParamLayer> } {
-  const theirs = new Map(wire(from, gate, cutFrom).map((f) => [f.name, f.value]));
+  const theirs = new Map(wire(from, gate, catalog).map((f) => [f.name, f.value]));
   const out: Record<string, WireValue> = {};
   const layers = new Set<ParamLayer>();
-  for (const f of wire(to, gate, cutTo)) {
+  for (const f of wire(to, gate, catalog)) {
     if (theirs.get(f.name) !== f.value) {
       out[f.name] = f.value;
       layers.add(f.layer);

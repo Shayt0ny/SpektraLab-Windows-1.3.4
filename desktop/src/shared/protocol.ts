@@ -47,16 +47,17 @@ export interface EventHeader {
   [k: string]: unknown;
 }
 
-export type PixelFormat = 'rgba8' | 'rgba16' | 'rgba16f';
+export type PixelFormat = 'rgba8' | 'rgba16';
 export type DisplaySpace = 'srgb' | 'display-p3';
 
 export interface ImageInfo {
-  display_matrix?: number[];
   width: number;
   height: number;
   format: PixelFormat;
   color_space: string;
   row_bytes: number;
+  source_width?: number;
+  source_height?: number;
 }
 
 export interface Capabilities {
@@ -99,6 +100,19 @@ export interface HelloResult {
   resources_dir: string;
   /** The methods this host answers (R1's `write_image` among them). */
   methods?: string[];
+  /** Actual host output transforms and ICCs, in recipe wire names. */
+  export_spaces?: string[];
+  /** Processed display pixel transports, independent of output/file encodings. */
+  view_formats?: PixelFormat[];
+  /** Decoded original transports; absent means RGBA8-only legacy source preview. */
+  source_formats?: PixelFormat[];
+  /** Optional processed-view modes; absent means legacy film-only rendering. */
+  view_options?: string[];
+  /** Optional RAW preview modes; embedded-only never falls back to RAW decode. */
+  thumbnail_options?: string[];
+  tiff_options?: string[];
+  /** "no-film": export_frame and render_proof take `no_film` -- the decode instead of the print (R4). */
+  frame_options?: string[];
   /** Frontend-side: true when the mock host answered. */
   mock?: boolean;
 }
@@ -118,6 +132,7 @@ export interface ParamsSchema {
 }
 
 export interface FileMetadata {
+  lens_correction?: { available: boolean; applied: boolean; profile?: string; reason?: string; distortion: boolean; tca: boolean; vignetting: boolean; scale: number };
   make?: string;
   model?: string;
   lens?: string;
@@ -125,6 +140,9 @@ export interface FileMetadata {
   shutter_s?: number;
   aperture?: number;
   focal_mm?: number;
+  exposure_program?: number;
+  exposure_bias_ev?: number;
+  focal_35mm?: number;
   datetime_original?: string;
   orientation?: number;
   /** The camera's white balance (R2): RAW only. */
@@ -132,7 +150,8 @@ export interface FileMetadata {
 }
 
 export interface ProbeResult {
-  kind: 'raw' | 'tiff' | 'jpeg' | 'png';
+  pair_info?: PairInfo;
+  kind: 'raw' | 'tiff' | 'jpeg' | 'png' | 'heic' | 'exr' | 'pair';
   width: number;
   height: number;
   metadata: FileMetadata;
@@ -141,19 +160,58 @@ export interface ProbeResult {
 export type WireValue = number | boolean | string;
 export type WireParams = Record<string, WireValue>;
 
+export interface PairInfo {
+  left?: { width: number; height: number; kind?: string; metadata?: FileMetadata; available: boolean; error?: string; metered_ev?: number; metered_for?: string };
+  right?: { width: number; height: number; kind?: string; metadata?: FileMetadata; available: boolean; error?: string; metered_ev?: number; metered_for?: string };
+  gates?: { x: number; y: number; width: number; height: number }[];
+}
+
 export interface OpenResult {
   session: string;
   width: number;
   height: number;
-  /** `raw` | `tiff` | `jpeg` | `png`. */
+  /** `raw` | `tiff` | `jpeg` | `png` | `heic` | `exr`. */
   kind?: string;
   metadata: FileMetadata;
   params: WireParams;
-  timings_ms?: { decode?: number; open?: number };
-  /** `open_pair`: the second frame's metadata, each hole's meter, the piece's layout. */
-  metadata_b?: FileMetadata | null;
-  metered_ev?: (number | null)[];
-  layout?: { hole_w: number; hole_h: number; advance: number; turned: boolean };
+  pair_info?: PairInfo;
+  timings_ms?: { decode?: number; open?: number; raw?: RawTimings };
+}
+
+export interface RawTimings {
+  open: number; unpack: number; process: number; convert: number; total: number;
+  openmp_enabled: boolean; workers: number;
+}
+
+/** Cached film print -> encoded ProPhoto grade -> geometry -> size -> display. */
+export interface RenderViewResult {
+  image: ImageInfo;
+  tier: Tier;
+  generation: number;
+  print_cached: boolean;
+  timings_ms: { print: number; post: number; readback: number; total: number };
+}
+
+/** File-resolution processing and selected-depth quantisation precede the
+ * GPU proof downsample. The payload contains only display-ready RGBA8. */
+export interface RenderProofResult {
+  encoding?: 'cineon';
+  image: ImageInfo;
+  generation: number;
+  file_width: number; file_height: number;
+  color_space: string; bit_depth: 8 | 16;
+  compression_simulated: false;
+  print_cached: boolean;
+  stats: { pixels: number; moved_fraction: number; outside_fraction: number; clipped_fraction: number };
+  timings_ms: RenderViewResult['timings_ms'];
+}
+
+/** export_frame always returns metadata, never a pixel payload. */
+export interface ExportFrameResult {
+  path: string; width: number; height: number; bytes: number; color_space: string;
+  print_cached: boolean;
+  timings_ms: { print: number; post: number; readback: number; encode_write: number; total: number;
+    source?: { decode: number; open: number; raw?: RawTimings } };
 }
 
 export type Tier = 'live' | 'preview' | 'full';
@@ -170,7 +228,7 @@ export interface ExportImageParams {
   path: string;
   format: 'tiff16' | 'tiff8' | 'jpeg' | 'png';
   quality?: number;
-  color_space?: 'sRGB' | 'display-p3' | 'prophoto';
+  color_space?: 'sRGB' | 'display-p3' | 'prophoto' | 'adobe-rgb' | 'rec2020';
   long_edge?: number;
   overwrite?: boolean;
 }

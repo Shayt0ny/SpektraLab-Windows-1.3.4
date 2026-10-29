@@ -964,13 +964,20 @@ crop overlay, a meter or a per-gate print cut on the picture and off the
 rebate. The quad is the gate's nominal rectangle; the gate's own corners, ears
 and penumbra are inside a few tenths of a millimetre of it.
 
+**Windows backend validation (2026-10-18):** Scene Placement's first/second
+curve, both frame orientations, global strip offsets, and SHOOT cache
+invalidation are covered by `gpu_vulkan_scene_latitude.cpp` (72 numerical
+cases against the CPU fit evaluator, plus C API tests). This is implemented
+engine behavior; a pair editor must still submit the correct split/region and
+map the selected gate's fit to its corresponding parameter set. Actual Metal
+and Intel GPU comparisons remain separate validation gates.
+
 **Proposed, not implemented** (for the frontend contract):
 
-1. A per-gate Scene Placement for a pair (the half-frame pair's E3).
-2. A per-render diagnostic when a date is asked for but not drawn (wrong
+1. A per-render diagnostic when a date is asked for but not drawn (wrong
    format or style), so the UI can grey the control instead of failing
    silently.
-3. `overscan_holes` acts only in the print stages and could become
+2. `overscan_holes` acts only in the print stages and could become
    `print`-layer (a reprint, not a re-develop). It stays `shoot` until a
    reprint is shown to keep the overscan layout across a pipeline rebuild.
 
@@ -1009,7 +1016,98 @@ any other value is refused with the list.
   the 135 and 645 rebates change by at most 1/255 under `w25`.
 - Not verified: colour stocks beyond one render; the app has no control for it.
 
-## 16. CineStill 800T — the back-reflection halo and `halation_headroom_ev` (2026-10-23, branch `cinestill-800t`)
+## 16. Windows half frame document storage
+
+The desktop's Tauri storage commands manage `.spektrapair` JSON documents,
+separately from the rendering host. The schema mirrors `HalfFramePair.swift`:
+`schemaVersion:1`, absolute `folder`, optional `left` and `right` holes,
+`spacingMM` (0.5–2, default 1), `onStrip` and `turned`. A hole references an
+absolute photograph path and carries its own placement, decode, geometry,
+meter, exposure, optional print/grade and frame/film scope. Nested pairs are
+refused; source photographs are never consumed or modified.
+
+| Tauri command | Parameters | Result |
+|---|---|---|
+| `pair_create` | `{folder,value}` | file entry `{path,name,size,mtime_ms}` in the app's `Sidecars/Pairs` store; folder must match the document |
+| `pair_load` | `{path}` | validated document, or null when absent; external documents may be read |
+| `pair_save` | `{path,value}` | atomic replacement, confined to the app's pair store |
+| `pair_list` | `{folder}` | documents belonging to exactly this standardized folder |
+| `pair_delete` | `{path}` | removes only the pair document in the app's store |
+
+Documents are limited to 1 MiB. Version/type/range failures are explicit;
+invalid stored files are omitted from listing. Writes use a flushed temporary
+file and atomic rename; a failed write preserves the previous document.
+Folder image scanning does not discover unrelated historical pairs. Explicit
+pair paths are accepted by `expand_paths`, while folder association requires
+an explicit `pair_list`. Pair rendering has its own host contract and must
+not be inferred from storage availability.
+
+### Windows Film Edge/date validation (2026-10-18)
+
+The four physical overscan stages now run in Vulkan, in the same positions
+as Metal. CPU vector masks retain physical dimensions, exposure weights,
+seeded placement and Gaussian kernel order. Apple keeps CoreText/CoreGraphics;
+Windows embeds pinned Liberation Sans 2.1.5 regular/bold and stb_truetype
+(licenses/checksums in `engine/resources_product/fonts/README.md` and
+`engine/third_party/stb/README.md`). Font outlines differ from Helvetica Neue;
+this is a declared typography difference, not a material-profile modification.
+1.3.4's CineStill 800T edge asks for two more faces: **Menlo-Bold** (its 135
+numbers) is drawn with the embedded DejaVu Sans Mono Bold 2.37 (Menlo's own
+ancestor, same advance and cap height), and **ArialNarrow** (its 120 name and
+batch number) with Liberation Sans Regular condensed to 0.82 across (Arial
+Narrow's measured ratio to Arial). Measured against the Metal engine
+(2026-10-29), these cut the CineStill edge canvases' difference 4-5x (135: mean
+0.070 -> 0.015 code; 120: 0.247 -> 0.062); what remains is glyph shape. Marks
+the engine draws as vectors (date back, dot faces, DX code, arrows) are filled
+with exact-area coverage since 2026-10-29, as CoreGraphics fills them.
+
+The unmodified overscan regression corpus and product BW/filter/DX corpus
+pass on the RTX 5070 Ti. `host_film_edge.py` separately proves held crop/turn/
+flip parity against independently cropped input, full canvas dimensions at
+preview tiers, original isolation, cached reprint and atomic invalid-input
+handling. Mac/Metal and Intel runtime parity still require their own runs.
+
+## 17. Windows lens correction and persistent display cache
+
+RAW `decode` accepts `lens_correction: boolean` (default false) for open,
+redecode and immutable export snapshots. `metadata.lens_correction` reports
+`available`, `applied`, matched `profile`, refusal `reason`, actual `distortion`,
+`tca`, `vignetting`, automatic crop `scale`, and `focus_distance_m` plus
+`focus_distance_assumed`. Standard EXIF SubjectDistance is used when valid;
+otherwise 1000 m is the explicit far-focus assumption. A missing/ambiguous
+profile or non-RAW input cannot silently claim correction. Lensfun operates on
+unoriented sensor coordinates while returning the original displayed direction;
+TCA reconstructs camera channels from the recorded camera-to-working matrix.
+Float negatives and highlight headroom are preserved. The source file is unchanged.
+
+Tauri display-cache commands are separate from the render protocol:
+
+| Command | Contract |
+|---|---|
+| `frame_cache_key` | `{descriptor:{kind:"print"|"original",sources:[absolute paths],configuration}}` -> SHA-256 key; includes current file identity/size/nanosecond mtime and actual engine/resource fingerprint |
+| `frame_cache_read` | `{key}` -> framed `{hit,metadata?}` plus display pixels; corrupt entries become misses and are removed |
+| `frame_cache_write` | binary framed `{key,metadata:{image}}` plus tight RGBA8/RGBA16 display bytes -> stored boolean |
+| `frame_cache_status` | capacity, current bytes/entries, per-entry bound and cache path |
+| `frame_cache_configure` | `{capBytes}` from 0 to 64 GiB; default 16 GiB; zero disables and evicts |
+| `frame_cache_clear` | removes recognized cache entries only; leaves source photos, sidecars and unrelated files intact |
+
+Writes are atomic and checksummed; LRU eviction enforces disk capacity, one
+frontend write at a time bounds transient copies, and pictures above 64 MiB
+are skipped. Keys are captured before rendering and reused for the write.
+The Windows cache stores the final bounded display view (post/geometry/space
+are therefore in the key); Mac stores an intermediate print and applies those
+steps at draw time. Cached pixels never satisfy decoded engine input, neutral
+sampling or export. Reopening may display a saved picture while the real
+session opens in the background, with the same generation guards as rendering.
+
+Source-neutral picking also covers half-frame pairs: `pick_neutral` accepts
+`{session,x,y,side:"left"|"right"}` with coordinates relative to the entire
+decoded composite. The complete 5×5 patch must fit in the selected hole. Its
+exposure gain is removed before clipping checks and RAW calibration; cached
+half-float pictures retain their own decode calibration. Non-RAW, missing holes,
+gap/edge samples and a mismatched side fail explicitly. Single-source calls
+retain their original `{session,x,y}` contract.
+## 18. CineStill 800T — the back-reflection halo and `halation_headroom_ev` (2026-10-23, branch `cinestill-800t`)
 
 **`film_stock: "cinestill_800t"`** is a product profile (`engine/resources_product/profiles/`) and
 an **alias**: `"derived_from": "kodak_vision3_500t"` with only `info` keys of its own (`name`,
@@ -1048,5 +1146,44 @@ parity case for it.**
 its statistic) and **before `film_overscan`**: the edge print, fog and date are exposures the engine
 knows exactly, and halate at what they are. Measured canvas against export (live 1200 px vs full
 downscaled): the halo's energy is 0.83–1.01 of the export's (the low end a frame of tiny lights), and the frame's mean difference is no
-larger than plain 500T's. The kernel `spk_highlight_headroom` is Metal only: the Vulkan backend
-refuses a back-reflection film at dispatch.
+larger than plain 500T's. The kernel `spk_highlight_headroom` runs on both backends: Metal
+(`nodes.metal`) and, since 2026-10-29, Vulkan (`shaders/vulkan/spk_highlight_headroom.comp`,
+the same formula). A back-reflection film is no longer refused on Windows/Linux. Graded against
+the 1.3.4 Metal engine on a Mac (MoltenVK, `engine/tests/parity_metal_vulkan.py`): CineStill 800T at
+headroom 0, 4 and 8, amount 4, its scan and its density tap agree to <= 0.01 of an 8-bit code;
+the wire is unchanged.
+
+## 19. `no_film` — "Don't Apply Film Simulation" on the desktop host (2026-10-29, R4)
+
+The 1.3.4 Mac app's per-frame *Don't Apply Film Simulation* (`Sidecar.noFilm`,
+`Exporter.filePixels`, fd891c6b) writes the **decode** at its own pixels, in the
+working space, through the same Layer 2 grade, geometry and output conversion a
+print takes. The Windows/Linux host's file and proof methods carry it as one
+additive field (desktop/PROTOCOL-REQUESTS.md R4):
+
+| method | field | type | default | meaning |
+|---|---|---|---|---|
+| `export_frame`, `render_proof` | `no_film` | bool | `false` | `true`: the session's decoded source (native size, linear ProPhoto encoded with ProPhoto's transfer function and clipped to [0, 1], as the Mac's `rgba16Unorm` decode texture is) replaces the print; then `adjustments` (Layer 2), `geometry`, `long_edge`, the output transform for `color_space` (the same file-boundary chroma knee a print passes), encode and EXIF, unchanged. `params`, `source_geometry` and `scene_placement` are **not applied** (the editor's session is not modified); no DI view, no pair layers, never cached as the print. |
+
+- `no_film: true` with `export_cineon`, or with `render_proof` `format: "di"`: `bad_request` (the Digital Intermediate is the film's negative).
+- On a half-frame pair session: `bad_request` (the Mac disables the switch for a pair).
+- A non-boolean `no_film`: `bad_request`.
+- `hello.frame_options` lists `"no-film"`.
+- Engine side: `spk::view::Request::no_film` (internal desktop boundary, `view.hpp`), not a C ABI field and not a `params_schema` field.
+
+**Against the Mac.** For a flat file (PNG, JPEG, TIFF) the Mac's decode is the
+file's own rendering in the working space, so the pixels are the same chain:
+`engine/tests/host_no_film.py` writes a low-chroma PNG and gets it back from a
+no-film sRGB 16-bit file within 1 code (mean 0.001), while the film print of the
+same frame differs by 11 codes on average. For a **RAW** the Mac draws Apple's
+default Core Image rendering (`decoded.display`, its tone curve on) and the host
+the LibRaw linear decode -- the same pixels its `render_source` shows; that is
+the RAW-decoder difference already declared, not something this field can close.
+
+Test: `engine/tests/host_no_film.py` (a host CTest, `spk_host_no_film_workflow`).
+Red on the host before this change (it wrote the print: max 38, mean 11.0 codes
+from the decode).
+
+### Personal Windows fork integration (2026-10-29)
+
+The integrated host also advertises `hello.view_options: ["no_film"]` and accepts bypass on `render_view`. Unlike the upstream RGBA16 intermediate described above, this fork retains encoded floating-point ProPhoto until post-processing and output, so reducing exposure can recover highlights above 1. This is an intentional precision extension, not a claim of identical upstream bypass pixels. Both `frame_options` and `view_options` are advertised for their respective methods. DI plus `no_film: true` is rejected. The paired tests are `host_no_film.py` (native view/RAW/cache) and `host_no_film_upstream.py` (R4 export/proof).

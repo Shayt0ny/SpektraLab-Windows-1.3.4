@@ -13,11 +13,18 @@
 // erasable TypeScript so `node main.ts` runs it without a build step.
 
 import schemaFields from './schema-fields.json' with { type: 'json' };
+import { mockView } from './view.ts';
+import type { Adjustments } from '../src/shared/adjustments.ts';
+import type { Geometry } from '../src/shared/geometry.ts';
+import { GEOMETRY_DEFAULT, outputSize } from '../src/shared/geometry.ts';
+import { decodePair, sourcePairLayout, type HalfFramePair } from '../src/shared/pair.ts';
+import type { PairInfo } from '../src/shared/protocol.ts';
 
 export interface MockRequest {
   id: number;
   method: string;
   params: Record<string, unknown>;
+  payload?: Uint8Array;
 }
 
 export interface MockReply {
@@ -26,6 +33,8 @@ export interface MockReply {
 }
 
 export interface MockOptions {
+  /** Test both the new source-view option and conservative legacy negotiation. */
+  supportsNoFilm?: boolean;
   /** Report the real host's `unsupported_features` list (default true). */
   realisticUnsupported?: boolean;
   /** Native size of every synthetic frame. */
@@ -105,10 +114,11 @@ function defaultFor(f: SchemaField): Value {
   }
 }
 
-// The real host refused these five until they were ported to Vulkan
-// (engine/PORT_PLAN.md); it refuses none of them now. `realisticUnsupported`
-// still drives the refusal path when a test sets the list itself.
-export const UNSUPPORTED_ON_PORT: string[] = [];
+export const UNSUPPORTED_ON_PORT = [
+  'contrast_mask',
+  'overscan',
+  'date_imprint',
+];
 
 const STOCKS: Record<string, number> = {};
 function stockHue(id: string): number {
@@ -132,13 +142,18 @@ interface Session {
   height: number;
   params: Record<string, Value>;
   seed: number;
+  decodeKey: string;
+  viewPrints: Map<string, { width: number; height: number; data: Uint8Array }>;
+  sourceGeometry?: Geometry;
+  pair?: HalfFramePair;
+  pairInfo?: PairInfo;
 }
 
 /** What `hello.methods` lists: every method `dispatch` answers. */
 const METHODS = [
   'hello', 'ping', 'shutdown', 'cancel', 'params_schema', 'print_lut_catalog', 'memory_report', 'probe', 'thumbnail',
-  'open', 'open_pair', 'redecode', 'close', 'set_params', 'get_params', 'solve', 'render', 'scene_latitude', 'overscan_geometry',
-  'preview_stock_lut', 'progress', 'export_image', 'export_cube', 'export_di', 'export_cineon_di',
+  'open', 'open_pair', 'update_pair', 'redecode', 'close', 'set_params', 'get_params', 'solve', 'render', 'render_view', 'scene_latitude', 'overscan_geometry',
+  'render_source', 'preview_stock_lut', 'progress', 'export_image', 'export_frame', 'export_cineon', 'render_proof', 'export_cube', 'export_di',
 ];
 
 class HostError extends Error {
@@ -156,6 +171,7 @@ export class MockHost {
 
   constructor(opts: MockOptions = {}) {
     this.opts = {
+      supportsNoFilm: opts.supportsNoFilm ?? true,
       realisticUnsupported: opts.realisticUnsupported ?? true,
       nativeWidth: opts.nativeWidth ?? 3000,
       nativeHeight: opts.nativeHeight ?? 2000,
@@ -166,7 +182,10 @@ export class MockHost {
 
   async handle(req: MockRequest): Promise<MockReply> {
     try {
-      const { result, payload } = await this.dispatch(req.method, req.params ?? {});
+      if (req.method === 'export_frame' && req.payload?.length) throw new HostError('bad_request', 'export_frame accepts no image payload');
+      // A real IPC frame snapshots the request. In-page calls must not retain
+      // mutable UI settings while a delayed mock render is in flight.
+      const { result, payload } = await this.dispatch(req.method, structuredClone(req.params ?? {}));
       return { header: { id: req.id, ok: true, result }, payload };
     } catch (e) {
       const err = e instanceof HostError ? e : new HostError('internal', String((e as Error)?.message ?? e));
@@ -223,6 +242,30 @@ export class MockHost {
     if (d.white_balance && this.kind(path) !== 'raw') throw new HostError('unsupported', 'white balance at decode needs a RAW file');
   }
 
+  private decodeKey(decode: unknown): string {
+    const d = (decode ?? {}) as Record<string, unknown>;
+    const wb = (d.white_balance ?? {}) as Record<string, unknown>;
+    return JSON.stringify([d.raw_mode ?? 'compatible16', wb.mode === 'custom' ? [wb.temperature_k, wb.tint ?? 0] : 'as_shot']);
+  }
+
+  private snapshot(s: Session, params: Record<string, Value>) {
+    this.validate(params);
+    if (Object.entries(params).some(([key, value]) => s.params[key] !== value)) {
+      Object.assign(s.params, params);
+      s.viewPrints.clear();
+    }
+  }
+
+  private noFilm(p: Record<string, unknown>, s: Session | null, cineon = false): boolean {
+    if ('no_film' in p && typeof p.no_film !== 'boolean') throw new HostError('bad_request', 'no_film must be boolean');
+    if (cineon && p.no_film === true) throw new HostError('bad_request', 'no_film cannot write a Digital Intermediate');
+    const active = p.no_film === true;
+    if (active && !this.opts.supportsNoFilm) throw new HostError('unsupported', 'no_film is not supported by this host');
+    if (active && (s?.pair || /\.spektrapair$/i.test(String(p.source_path ?? ''))))
+      throw new HostError('unsupported', 'no_film is not available for half-frame pairs');
+    return active;
+  }
+
   private metadata(path: string) {
     const h = hash(path);
     const raw = this.kind(path) === 'raw';
@@ -240,6 +283,38 @@ export class MockHost {
     };
   }
 
+  private pairDescription(pair: HalfFramePair) {
+    const info: PairInfo = {};
+    for (const side of ['left', 'right'] as const) {
+      const hole = pair[side];
+      if (hole && !this.opts.missing?.(hole.path)) info[side] = { ...this.dims(hole.path), kind: this.kind(hole.path) as 'raw',
+        available: true, metadata: this.metadata(hole.path), ...(hole.autoExposure ? { metered_ev: 0 } : {}) };
+      else info[side] = { width: 0, height: 0, available: false, error: hole ? 'Synthetic missing photograph' : 'Empty hole' };
+    }
+    const layout = sourcePairLayout(pair, { left: info.left?.available ? info.left : undefined, right: info.right?.available ? info.right : undefined });
+    info.gates = ['left', 'right'].map(side => { const r = layout.rects[side as 'left' | 'right'];
+      return { x: r.x / layout.size.width, y: r.y / layout.size.height, width: r.width / layout.size.width, height: r.height / layout.size.height }; });
+    return { info, layout };
+  }
+
+  /** Synthetic control fixture only: actual pair pixel parity is tested against the native host. */
+  private pairPixels(s: Session, width: number, height: number) {
+    if (!s.pair) return paint(width, height, s.seed, s.params);
+    const out = new Uint8Array(width * height * 4); for (let i = 3; i < out.length; i += 4) out[i] = 255;
+    const gates = this.pairDescription(s.pair).info.gates!;
+    for (const [i, side] of (['left', 'right'] as const).entries()) {
+      const hole = s.pair[side]; if (!hole || this.opts.missing?.(hole.path)) continue;
+      const g = gates[i]!, x = Math.round(g.x * width), y = Math.round(g.y * height);
+      const w = Math.max(1, Math.min(width - x, Math.round(g.width * width))), h = Math.max(1, Math.min(height - y, Math.round(g.height * height)));
+      const params = { ...s.params, exposure_compensation_ev: Number(s.params.exposure_compensation_ev ?? 0) + hole.exposureEV,
+        print_exposure: hole.print ? 2 ** hole.print.brightnessStops : s.params.print_exposure! };
+      const seed = hash(hole.path + JSON.stringify([hole.placement, hole.geometry, hole.decode]));
+      const pixels = mockView(paint(w, h, seed, params), w, h, hole.adjustments ?? undefined, GEOMETRY_DEFAULT, 'srgb', 0).data;
+      for (let row = 0; row < h; ++row) out.set(pixels.subarray(row * w * 4, (row + 1) * w * 4), ((y + row) * width + x) * 4);
+    }
+    return out;
+  }
+
   private async dispatch(method: string, p: Record<string, unknown>): Promise<{ result: unknown; payload?: Uint8Array }> {
     switch (method) {
       case 'hello':
@@ -252,6 +327,12 @@ export class MockHost {
             capabilities: this.capabilities(),
             resources_dir: '(mock)',
             methods: METHODS,
+            export_spaces: ['sRGB', 'display-p3', 'prophoto', 'adobe-rgb', 'rec2020'],
+            tiff_options: ['lzw', 'preview-page'],
+            thumbnail_options: ['embedded-only'],
+            source_formats: ['rgba8', 'rgba16'],
+            view_options: this.opts.supportsNoFilm ? ['no_film'] : [],
+            frame_options: this.opts.supportsNoFilm ? ['no-film'] : [],
           },
         };
       case 'ping':
@@ -277,14 +358,18 @@ export class MockHost {
       }
       case 'thumbnail': {
         const path = String(p.path ?? '');
+        if ('embedded_only' in p && typeof p.embedded_only !== 'boolean')
+          throw new HostError('bad_request', 'embedded_only must be boolean');
         if (this.opts.missing?.(path)) throw new HostError('not_found', `${path}: no such file`);
+        if (p.embedded_only && (this.kind(path) !== 'raw' || /\.(?:heic|heif|hif|exr|spektrapair)$/i.test(path)))
+          throw new HostError('unsupported', 'embedded_only thumbnails require a RAW file');
         const edge = Math.max(16, Math.min(1024, Number(p.long_edge ?? 256)));
         const { width, height } = this.dims(path);
         const s = edge / Math.max(width, height);
         const w = Math.max(1, Math.round(width * s));
         const h = Math.max(1, Math.round(height * s));
         const pixels = paint(w, h, hash(path), null);
-        return { result: { image: imageInfo(w, h) }, payload: pixels };
+        return { result: { image: imageInfo(w, h), source: this.kind(path) === 'raw' ? 'embedded' : 'decode', orientation_applied: true }, payload: pixels };
       }
       case 'open': {
         const path = String(p.path ?? '');
@@ -297,7 +382,7 @@ export class MockHost {
         this.checkDecode(path, p.decode);
         const id = 's' + this.next++;
         const { width, height } = this.dims(path);
-        this.sessions.set(id, { id, path, width, height, params, seed: hash(path) });
+        this.sessions.set(id, { id, path, width, height, params, seed: hash(path), decodeKey: this.decodeKey(p.decode), viewPrints: new Map() });
         return {
           result: {
             session: id,
@@ -310,45 +395,25 @@ export class MockHost {
           },
         };
       }
-      case 'open_pair': {
-        // The piece as the host lays it out: two 18 x 24 holes one advance apart.
-        const holes = (Array.isArray(p.holes) ? p.holes : []) as ({ path?: string } | null)[];
-        const first = holes.find((h) => h && h.path);
-        if (!first?.path) throw new HostError('bad_request', 'open_pair: no frame in either hole');
-        const params: Record<string, Value> = {};
-        for (const f of FIELDS) params[f.name] = defaultFor(f);
-        const incoming = (p.params ?? {}) as Record<string, unknown>;
-        this.validate(incoming);
+      case 'open_pair':
+      case 'update_pair': {
+        const pair = decodePair(p.pair); if (!pair) throw new HostError('bad_request', 'invalid pair recipe');
+        const old = method === 'update_pair' ? this.session(p) : null;
+        if (old && !old.pair) throw new HostError('bad_request', 'update_pair needs a pair session');
+        const path = old?.path ?? String(p.path ?? '');
+        const incoming = (p.params ?? {}) as Record<string, Value>; this.validate(incoming);
+        const params: Record<string, Value> = old ? { ...old.params } : Object.fromEntries(FIELDS.map(f => [f.name, defaultFor(f)]));
         Object.assign(params, incoming, { auto_exposure: false });
-        const across = 1200;
-        const along = Math.round((across * 18) / 24);
-        const spacing = Number(p.spacing_mm ?? 1);
-        const advance = Math.round((along * (18 + spacing)) / 18);
-        const turned = p.turned === true;
-        const width = turned ? across : advance + along;
-        const height = turned ? advance + along : across;
-        const id = 's' + this.next++;
-        const path = `pair:${holes.map((h) => h?.path ?? '').join('|')}`;
-        this.sessions.set(id, { id, path, width, height, params, seed: hash(path) });
-        const second = holes[1]?.path;
-        return {
-          result: {
-            session: id,
-            width,
-            height,
-            kind: 'pair',
-            metadata: this.metadata(first.path),
-            metadata_b: second ? this.metadata(second) : null,
-            metered_ev: holes.map((h) => (h ? 0 : null)),
-            layout: { hole_w: turned ? across : along, hole_h: turned ? along : across, advance, turned },
-            params,
-            timings_ms: { decode: 24, open: 3 },
-          },
-        };
+        const { info, layout } = this.pairDescription(pair), id = old?.id ?? 's' + this.next++;
+        const s: Session = { id, path, ...layout.size, params, seed: hash(path), decodeKey: '', viewPrints: new Map(), pair, pairInfo: info };
+        this.sessions.set(id, s);
+        return { result: { session: id, ...layout.size, kind: 'pair', metadata: info.left?.metadata ?? info.right?.metadata ?? {}, pair_info: info, params, timings_ms: { decode: 0, open: 0 } } };
       }
       case 'redecode': {
         const s = this.session(p);
         this.checkDecode(s.path, p.decode);
+        s.viewPrints.clear();
+        s.decodeKey = this.decodeKey(p.decode);
         return {
           result: { session: s.id, width: s.width, height: s.height, kind: this.kind(s.path), metadata: this.metadata(s.path), params: s.params, timings_ms: { decode: 12, open: 3 } },
         };
@@ -361,6 +426,7 @@ export class MockHost {
         const delta = (p.delta ?? {}) as Record<string, unknown>;
         this.validate(delta);
         Object.assign(s.params, delta);
+        s.viewPrints.clear();
         return { result: { params: s.params } };
       }
       case 'get_params':
@@ -369,7 +435,7 @@ export class MockHost {
         const s = this.session(p);
         return {
           result: {
-            solved_params: { c_filter_neutral: 0, m_filter_neutral: 55, y_filter_neutral: 65, exposure_compensation_ev: 0 },
+            solved_params: { c_filter_neutral: 0, m_filter_neutral: 55, y_filter_neutral: 65, ...(!s.pair ? { exposure_compensation_ev: 0 } : {}) },
             exposure_ev_by_method: { balanced: 0.3, center: 0.1, protect_highlights: -0.4, protect_shadows: 0.6 },
             session: s.id,
           },
@@ -378,9 +444,7 @@ export class MockHost {
       case 'render': {
         const s = this.session(p);
         const tier = String(p.tier ?? 'preview');
-        // Mock paint is sRGB; production uses a tagged half-float ProPhoto
-        // texture. Keep the mock's actual bytes honestly tagged.
-        const format = p.format === 'rgba16f' ? 'rgba8' : String(p.format ?? 'rgba8');
+        const format = String(p.format ?? 'rgba8');
         if (format !== 'rgba8' && format !== 'rgba16') throw new HostError('bad_request', `format ${format}`);
         const preview = Number(s.params.preview_long_edge ?? 2560) || 2560;
         const scale = tier === 'full' ? 1 : Math.min(1, preview / Math.max(s.width, s.height));
@@ -410,10 +474,84 @@ export class MockHost {
           payload,
         };
       }
+      case 'render_view': {
+        const s = this.session(p);
+        const noFilm = this.noFilm(p, s);
+        if (p.params) this.snapshot(s, p.params as Record<string, Value>);
+        if (!noFilm && p.source_geometry && JSON.stringify(p.source_geometry) !== JSON.stringify(s.sourceGeometry ?? GEOMETRY_DEFAULT)) {
+          s.sourceGeometry = structuredClone(p.source_geometry as Geometry); s.viewPrints.clear();
+        }
+        const tier = String(p.tier ?? 'live');
+        const display = String(p.display ?? 'srgb');
+        if (display !== 'srgb' && display !== 'display-p3') throw new HostError('bad_request', 'preview display must be srgb or display-p3');
+        const cached = !noFilm && s.viewPrints.has(tier);
+        let print = noFilm ? undefined : s.viewPrints.get(tier);
+        if (!print) {
+          const edge = Number(s.params.preview_long_edge ?? 2560) || 2560;
+          const scale = tier === 'full' ? 1 : Math.min(1, edge / Math.max(s.width, s.height));
+          const width = Math.max(1, Math.round(s.width * scale)), height = Math.max(1, Math.round(s.height * scale));
+          print = mockView(noFilm ? paint(width, height, s.seed, null) : this.pairPixels(s, width, height), width, height, undefined,
+            noFilm ? GEOMETRY_DEFAULT : s.sourceGeometry ?? GEOMETRY_DEFAULT, 'srgb', 0);
+          if (!noFilm) s.viewPrints.set(tier, print);
+        }
+        if (this.opts.renderDelayMs) await sleep(tier === 'full' ? this.opts.renderDelayMs * 3 : this.opts.renderDelayMs);
+        const view = mockView(print.data, print.width, print.height, p.adjustments as Adjustments | undefined,
+          p.geometry as Geometry | undefined, display, Number(p.long_edge ?? 0));
+        return {
+          result: { image: { ...imageInfo(view.width, view.height), color_space: display === 'display-p3' ? 'Display P3' : 'sRGB', processed: true,
+            source_width: outputSize(noFilm ? GEOMETRY_DEFAULT : s.sourceGeometry ?? GEOMETRY_DEFAULT, s).width,
+            source_height: outputSize(noFilm ? GEOMETRY_DEFAULT : s.sourceGeometry ?? GEOMETRY_DEFAULT, s).height },
+            tier, print_cached: cached, generation: p.generation, pair_info: s.pairInfo, timings_ms: { mock_view: 5 } },
+          payload: view.data,
+        };
+      }
+      case 'render_proof': {
+        // Synthetic protocol fixture only; not a colour or gamut-stat oracle.
+        const s = this.session(p);
+        const cineon = p.format === 'di';
+        const noFilm = this.noFilm(p, s, cineon);
+        if (p.params) this.snapshot(s, p.params as Record<string, Value>);
+        const edge = Number(p.proof_long_edge);
+        if (!Number.isInteger(edge) || edge < 1 || edge > 4096) throw new HostError('bad_request', 'invalid proof size');
+        const display = String(p.display ?? 'srgb');
+        if (!['srgb', 'display-p3'].includes(display)) throw new HostError('bad_request', 'invalid proof display');
+        const source = mockView(paint(s.width, s.height, s.seed, noFilm ? null : s.params), s.width, s.height,
+          undefined, noFilm ? GEOMETRY_DEFAULT : p.source_geometry as Geometry | undefined, 'srgb', 0);
+        const file = mockView(source.data, source.width, source.height,
+          cineon ? undefined : p.adjustments as Adjustments | undefined, p.geometry as Geometry | undefined, 'srgb', cineon ? 0 : Number(p.long_edge ?? 0));
+        const view = mockView(file.data, file.width, file.height, undefined, GEOMETRY_DEFAULT, display, edge);
+        return { result: { image: { ...imageInfo(view.width, view.height), color_space: display },
+          generation: p.generation, file_width: file.width, file_height: file.height,
+          color_space: cineon ? 'ProPhoto RGB' : p.color_space, bit_depth: cineon || p.format === 'tiff16' ? 16 : 8,
+          ...(cineon ? { encoding: 'cineon' } : {}),
+          compression_simulated: false, print_cached: false,
+          stats: { pixels: file.width * file.height, moved_fraction: 0, clipped_fraction: 0, outside_fraction: 0 },
+          timings_ms: { print: 0, post: 0, readback: 0, total: 0 }, mock: true }, payload: view.data };
+      }
+      case 'render_source': {
+        // The decoded source, before film, grade and crop: the synthetic picture without a print.
+        const s = this.session(p);
+        const display = String(p.display ?? 'srgb');
+        if (display !== 'srgb' && display !== 'display-p3') throw new HostError('bad_request', 'display must be srgb or display-p3');
+        const format = String(p.format ?? 'rgba8');
+        if (format !== 'rgba8' && format !== 'rgba16') throw new HostError('bad_request', 'source format must be rgba8 or rgba16');
+        const le = Number(p.long_edge ?? 0);
+        const k = le > 0 ? Math.min(1, le / Math.max(s.width, s.height)) : 1;
+        const w = Math.max(1, Math.round(s.width * k)), h = Math.max(1, Math.round(s.height * k));
+        const pixels = paint(w, h, s.seed, null);
+        let payload: Uint8Array = pixels;
+        if (format === 'rgba16') {
+          payload = new Uint8Array(pixels.length * 2);
+          const view = new DataView(payload.buffer);
+          for (let i=0;i<pixels.length;i++) view.setUint16(i*2,pixels[i]!*257,true);
+        }
+        return { result: { image: { ...imageInfo(w, h), format, row_bytes:w*(format === 'rgba16'?8:4), color_space: display === 'display-p3' ? 'Display P3' : 'sRGB' },
+          generation: p.generation, source: 'decoded' }, payload };
+      }
       case 'scene_latitude':
         return { result: latitude(this.session(p), (p.request ?? {}) as Record<string, unknown>) };
       case 'overscan_geometry':
-        return { result: { valid: false } };
+        throw new HostError('unsupported', 'overscan is not available on this host');
       case 'preview_stock_lut': {
         const w = 64, h = 64;
         return { result: { image: imageInfo(w, h) }, payload: paint(w, h, hash(String(p.print_stock)), null) };
@@ -434,9 +572,33 @@ export class MockHost {
           },
         };
       }
+      case 'export_cineon':
+      case 'export_frame': {
+        const s = p.session ? this.session(p) : null;
+        const noFilm = this.noFilm(p, s, method === 'export_cineon');
+        const sourcePath = s?.path ?? String(p.source_path ?? '');
+        if (!sourcePath || !p.path) throw new HostError('bad_request', 'export needs source_path or session and path');
+        if (this.opts.missing?.(sourcePath)) throw new HostError('not_found', `${sourcePath}: no such file`);
+        if (!['jpeg', 'png', 'tiff8', 'tiff16'].includes(String(p.format ?? 'tiff16'))) throw new HostError('bad_request', 'unsupported export format');
+        this.checkDecode(sourcePath, p.decode);
+        const editor = s && (p.decode === undefined || this.decodeKey(p.decode) === s.decodeKey) ? s : null;
+        if (p.params) {
+          this.validate(p.params as Record<string, unknown>);
+          if (editor) this.snapshot(editor, p.params as Record<string, Value>);
+        }
+        const native = s ? { width: s.width, height: s.height } : this.dims(sourcePath);
+        const cut = outputSize(noFilm ? GEOMETRY_DEFAULT : (p.source_geometry as Geometry | undefined) ?? GEOMETRY_DEFAULT, native);
+        const out = outputSize((p.geometry as Geometry | undefined) ?? GEOMETRY_DEFAULT, cut);
+        const edge = method === 'export_cineon' ? 0 : Number(p.long_edge ?? 0);
+        const scale = edge > 0 ? Math.min(1, edge / Math.max(out.width, out.height)) : 1;
+        return { result: { path: String(p.path), width: Math.max(1, Math.round(out.width * scale)),
+          height: Math.max(1, Math.round(out.height * scale)), bytes: 0, color_space: p.color_space ?? 'srgb',
+          generation: p.generation, print_cached: !noFilm && (editor?.viewPrints.has('full') ?? false), exif_copied: true,
+          ...(method === 'export_cineon' ? { encoding: 'cineon', primaries: 'ProPhoto RGB', view_luts: [] } : {}),
+          timings_ms: { print: 0, post: 0, readback: 0, encode_write: 0, total: 0 }, mock: true } };
+      }
       case 'export_cube':
       case 'export_di':
-      case 'export_cineon_di':
         return { result: { path: String(p.path), mock: true } };
       default:
         throw new HostError('bad_request', `unknown method ${method}`);
@@ -464,7 +626,7 @@ export class MockHost {
           overscan_active: 'overscan',
           date_imprint_active: 'date_imprint',
         };
-        if (gate[k] && UNSUPPORTED_ON_PORT.includes(gate[k])) throw new HostError('unsupported', `${gate[k]} is not available on this host`);
+        if (gate[k]) throw new HostError('unsupported', `${gate[k]} is not available on this host`);
       }
     }
   }

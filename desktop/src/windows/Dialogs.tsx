@@ -11,6 +11,9 @@ import { platform, type AppPaths } from '../platform';
 import { recomputeFilmFormat, requestPrint, setPages, useSession, sessionStore } from '../state/session';
 import { INTERFACE_SCALES, PREVIEW_EDGES, settingsStore, useSettings, SETTINGS_DEFAULT } from '../state/settings';
 import { featureGate } from '@shared/params';
+import { AgentsSettings, MemorySettings, UpdateSettings } from './SettingsPages';
+import { diagnosticReport } from './diagnosticReport';
+import { DiagnosticSettings } from './DiagnosticSettings';
 
 function Frame({ open, onClose, title, children, actions, testId }: { open: boolean; onClose: () => void; title: string; children: React.ReactNode; actions?: React.ReactNode; testId?: string }) {
   return (
@@ -43,6 +46,8 @@ export function SettingsDialog() {
   const gate = useSessionGate();
   const [paths, setPaths] = useState<AppPaths | null>(null);
   const [diag, setDiag] = useState<string>('');
+  const [diagnosticPaths, setDiagnosticPaths] = useState(false);
+  const [diagnosticNotice, setDiagnosticNotice] = useState('');
   useEffect(() => {
     if (open) {
       void platform().appPaths().then(setPaths);
@@ -56,9 +61,9 @@ export function SettingsDialog() {
   return (
     <Frame open={open} onClose={() => setPages({ settingsOpen: false })} title={tz('Settings', '设置')} testId="settings">
       <div className="tabs">
-        {(['general', 'rendering', 'diagnostics'] as const).map((p) => (
+        {(['general', 'rendering', 'memory', 'diagnostics', 'agents'] as const).map((p) => (
           <button key={p} className={page === p ? 'on' : ''} onClick={() => set('settingsPage', p)}>
-            {p === 'general' ? t('setTabGeneral') : p === 'rendering' ? t('setTabRendering') : t('setTabDiagnostics')}
+            {p === 'general' ? t('setTabGeneral') : p === 'rendering' ? t('setTabRendering') : p === 'memory' ? tz('Memory', '内存') : p === 'agents' ? tz('Agents', '智能体') : t('setTabDiagnostics')}
           </button>
         ))}
       </div>
@@ -87,13 +92,14 @@ export function SettingsDialog() {
                 <button
                   className="btn"
                   onClick={() => {
-                    for (const k of ['leftCollapsed', 'rightCollapsed', 'filmstripCollapsed', 'leftWidth', 'rightWidth', 'collapsedSections'] as const) set(k, SETTINGS_DEFAULT[k] as never);
+                    for (const k of ['interfaceScale', 'parametersTab', 'leftCollapsed', 'rightCollapsed', 'filmstripCollapsed', 'leftWidth', 'rightWidth', 'collapsedSections'] as const) set(k, SETTINGS_DEFAULT[k] as never);
                   }}
                 >
                   {t('setResetLayout')}
                 </button>
               </div>
             </div>
+            <UpdateSettings version={paths?.version} os={paths?.os} />
           </>
         )}
         {page === 'rendering' && (
@@ -142,7 +148,7 @@ export function SettingsDialog() {
                 onChange={(v) => {
                   set('diBlueCompensation', v);
                   const s = sessionStore.getState();
-                  sessionStore.setState({ gate: featureGate(s.unsupported, v) });
+                  sessionStore.setState({ gate: featureGate(s.unsupported, v, s.hello?.view_options?.includes('no_film') ?? false) });
                 }}
               />
             </div>
@@ -150,6 +156,7 @@ export function SettingsDialog() {
         )}
         {page === 'diagnostics' && (
           <>
+            {open && <DiagnosticSettings paths={paths} hello={hello} includePaths={diagnosticPaths} />}
             <div className="settings-group">
               <h3>{tz('This session', '本次会话')}</h3>
               <div className="caption">
@@ -182,6 +189,23 @@ export function SettingsDialog() {
               </div>
             </div>
             <div className="settings-group">
+              <h3>{tz('Share diagnostics', '分享诊断')}</h3>
+              <ToggleRow label={tz('Include local paths and engine logs', '包含本地路径和引擎日志')} on={diagnosticPaths} onChange={setDiagnosticPaths} />
+              <p className="caption">{tz('Off by default. The basic report contains versions, GPU and capability information. Paths and logs may contain file names; nothing is uploaded automatically.', '默认关闭。基本报告包含版本、显卡及能力信息；路径和日志可能包含文件名，不会自动上传任何内容。')}</p>
+              <div className="row" style={{ gap: 8 }}>
+                <button className="btn" onClick={() => {
+                  void host().diagnostics().then((d) => { setDiag(JSON.stringify(d, null, 1)); setDiagnosticNotice(''); }).catch((e) => setDiagnosticNotice(String(e)));
+                }}>{tz('Refresh', '刷新')}</button>
+                <button className="btn" onClick={() => {
+                  void Promise.all([host().diagnostics(), host().memoryReport().catch(() => null)]).then(async ([d, memory]) => {
+                    await navigator.clipboard.writeText(JSON.stringify(diagnosticReport(paths, hello, d, diagnosticPaths, memory), null, 2));
+                    setDiagnosticNotice(tz('Diagnostics copied.', '诊断信息已复制。'));
+                  }).catch((e) => setDiagnosticNotice(String(e)));
+                }}>{tz('Copy diagnostics', '复制诊断信息')}</button>
+              </div>
+              {diagnosticNotice && <p className="caption" role="status">{diagnosticNotice}</p>}
+            </div>
+            <div className="settings-group">
               <h3>{tz('Engine host', '引擎进程')}</h3>
               <div className="mono" style={{ maxHeight: 180, overflow: 'auto' }}>
                 {diag}
@@ -189,6 +213,8 @@ export function SettingsDialog() {
             </div>
           </>
         )}
+        {open && page === 'memory' && <MemorySettings />}
+        {open && page === 'agents' && <AgentsSettings />}
       </div>
     </Frame>
   );
@@ -228,7 +254,6 @@ export function AboutDialog() {
             'SpektraLab 是依据 GNU GPL 第 3 版或更新版本发布的自由软件。胶片与相纸的特性数据依据 CC BY-SA 4.0 授权，署名如下。',
           )}
         </p>
-        <p className="caption">{tz('Original project: JamesQiu2005 · Windows port: NANATATA · Windows maintenance: shayt0ny', '原项目：JamesQiu2005 · Windows 移植：NANATATA · Windows 维护：shayt0ny')}</p>
         {texts.map((x) => (
           <details key={x.name}>
             <summary>{x.name}</summary>

@@ -23,17 +23,29 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #include "spektrafilm/spk_engine.h"
 #include "file_path.hpp"
@@ -48,8 +60,8 @@
 #include "print_lut.hpp"
 #include "setup_cache.hpp"
 #ifndef __APPLE__
-#include "edge_raster.hpp"
 #include "windows_unported.hpp"
+#include "view_process.hpp"
 #endif
 
 using namespace spk;
@@ -187,6 +199,24 @@ struct spk_session {
     // one copy is unavoidable; this makes that copy the upload.
     Image source;
 
+#ifndef __APPLE__
+    // No image buffer is retained here. The file owns the exact byte copy,
+    // and the indices preserve source/full-tier aliases on restoration.
+    struct ResidencySnapshot {
+        struct Plane { size_t bytes = 0; };
+        struct Slot {
+            size_t plane = size_t(-1);
+            uint32_t h = 0, w = 0, c = 3;
+        };
+        struct TierSlots { Slot image, negative, view_print; };
+        std::unique_ptr<std::FILE, decltype(&std::fclose)> file{nullptr, &std::fclose};
+        std::vector<Plane> planes;
+        Slot source;
+        std::unordered_map<std::string, TierSlots> tiers;
+    };
+    std::unique_ptr<ResidencySnapshot> residency;
+#endif
+
     Params params;
     std::unique_ptr<Pipeline> pipeline;
 
@@ -215,6 +245,11 @@ struct spk_session {
         uint32_t image_long_edge = 0;
         Image negative;   // Tap.CMY_FILM
         bool has_negative = false;
+#ifndef __APPLE__
+        // Encoded RGBA16 on device (c=2 uint32 words/pixel). Kept until a
+        // material parameter changes; view edits never redraw film grain.
+        Image view_print;
+#endif
         /// RFC-032 §27: the frame `negative`'s film canvas was laid out for,
         /// so a reprint can lay it out again. Zero without overscan.
         uint32_t overscan_frame_w = 0, overscan_frame_h = 0;
@@ -320,7 +355,7 @@ struct spk_engine {
         // These upstream effects still require kernels or Apple services that
         // have not been ported. Defaults stay usable; explicit requests fail.
         Json unported = Json::array();
-        for (const char* feature : windows_unported_features())
+        for (const char* feature : {"contrast_mask"})
             unported.push(Json(std::string(feature)));
         backend.set("unsupported_features", std::move(unported));
 #endif
@@ -411,24 +446,38 @@ struct spk_engine {
         // ones a frame switch is supposed to give back.
         Json session_rows = Json::array();
         size_t source_bytes = 0, negative_bytes = 0;
+        size_t view_bytes = 0, suspended_bytes = 0;
         int negative_count = 0;
         for (spk_session* s : sessions) {
             size_t source = 0;
             if (gpu && s->source.buf) source = gpu->size_bytes(s->source.buf.get());
             size_t negatives = 0;
+            size_t views = 0;
             int count = 0;
             for (const auto& kv : s->tiers) {
+#ifndef __APPLE__
+                if (gpu && kv.second.view_print.buf) views += gpu->size_bytes(kv.second.view_print.buf.get());
+#endif
                 if (!kv.second.has_negative || !kv.second.negative.buf || !gpu) continue;
                 negatives += gpu->size_bytes(kv.second.negative.buf.get());
                 ++count;
             }
             source_bytes += source;
             negative_bytes += negatives;
+            view_bytes += views;
             negative_count += count;
             Json row = Json::object();
             row.set("session_id", Json(s->session_id));
             row.set("source_bytes", Json(double(source)));
             row.set("cached_negative_bytes", Json(double(negatives)));
+            row.set("cached_view_bytes", Json(double(views)));
+#ifndef __APPLE__
+            size_t on_disk = 0;
+            if (s->residency) for (const auto& plane : s->residency->planes) on_disk += plane.bytes;
+            row.set("residency_suspended", Json(bool(s->residency)));
+            row.set("suspended_bytes", Json(double(on_disk)));
+            suspended_bytes += on_disk;
+#endif
             // A session caches a negative per tier it has rendered, so this
             // is 0, 1 or 3 -- and 3 is three full planes, which is worth
             // seeing next to the byte count rather than dividing by it.
@@ -447,6 +496,7 @@ struct spk_engine {
         persistent.set("file_backed_buffers", Json(double(pool.file_backed_buffers)));
         persistent.set("source_bytes", Json(double(source_bytes)));
         persistent.set("cached_negative_bytes", Json(double(negative_bytes)));
+        persistent.set("cached_view_bytes", Json(double(view_bytes)));
         persistent.set("negatives", Json(double(negative_count)));
         persistent.set("sessions", std::move(session_rows));
 
@@ -465,6 +515,8 @@ struct spk_engine {
 
         Json out = Json::object();
         out.set("total_bytes", Json(double(pool.total_bytes + pool.persistent_bytes)));
+        // Temporary-file bytes, not GPU allocations and not additive to total.
+        out.set("suspended_bytes", Json(double(suspended_bytes)));
         out.set("pool", std::move(pool_json));
         out.set("persistent", std::move(persistent));
         out.set("pressure", std::move(pressure));
@@ -578,18 +630,6 @@ spk_engine* spk_engine_create(const char* resources_dir, void* device) {
     if (!engine->print_luts.init(engine->resources_dir, error)) { g_error = error; return nullptr; }
 
 #ifndef __APPLE__
-    // The film edge's and the date's faces (resources/fonts/README.txt). A
-    // build without them is incomplete, like one without the constants.
-    edge::set_font_directory(engine->resources_dir + "/fonts");
-    {
-        double width = 0.0;
-        for (const char* face : {"HelveticaNeue", "HelveticaNeue-Bold", "ArialNarrow", "Menlo-Bold"})
-            if (!edge::text_width(face, 1.0, "0", 0.0, width) || !(width > 0.0)) {
-                g_error = std::string("cannot load the font for ") + face + " from " +
-                          engine->resources_dir + "/fonts";
-                return nullptr;
-            }
-    }
     if (device) { g_error = "Windows device-buffer input is not implemented yet; pass null"; return nullptr; }
     engine->gpu = gpu::Gpu::create_vulkan(engine->resources_dir + "/vulkan", error);
 #else
@@ -1075,26 +1115,119 @@ bool ensure_meter(spk_session* session, std::string& error) {
 // rather than a flag inside the single-pass one (P3) -- the un-striped path
 // stays exactly what ships, which is what makes §6's hash comparison mean
 // anything -- and one call site each, so the graph cannot drift between them.
+// Opt-in observation only: these plane multipliers are hypotheses calibrated
+// on the Windows 102 MP fixture, not admission limits or memory guarantees.
+// Frame high-water is cumulative; never label it a stage-local peak.
+struct MemoryEstimateTrace {
+    static constexpr unsigned kObserveOnly = 99;
+    spk_session* session;
+    const char* stage;
+    const char* cache;
+    const Image& image;
+    unsigned planes;
+    bool enabled = false;
+    bool success = false;
+    uint64_t observation = 0;
+    size_t output_payload_bytes = 0;
+    gpu::PoolStats before{};
+    MemoryEstimateTrace(spk_session* s, const char* label, const char* hit,
+                        const Image& input, unsigned count) noexcept
+        : session(s), stage(label), cache(hit), image(input), planes(count) {
+        const char* flag = std::getenv("SPEKTRAFILM_MEMORY_ESTIMATE");
+        enabled = flag && std::strcmp(flag, "1") == 0;
+        if (!enabled) return;
+        try { before = session->engine->gpu->pool_stats(); emit("begin");
+              observation = session->engine->gpu->begin_memory_observation(); }
+        catch (...) { enabled = false; }
+    }
+    ~MemoryEstimateTrace() noexcept {
+        if (enabled) { try {
+            if (observation) measured = session->engine->gpu->end_memory_observation(observation);
+            emit("end");
+        } catch (...) {} }
+    }
+    gpu::Gpu::MemoryObservation measured{};
+    void emit(const char* event) {
+        const auto now = session->engine->gpu->pool_stats();
+        const auto& p = session->params;
+        Json j = Json::object();
+        j.set("event", Json(std::string(event)));
+        j.set("stage", Json(std::string(stage)));
+        j.set("cache", Json(std::string(cache)));
+        j.set("model", Json(std::string("empirical-planes-v2-observe-only")));
+        j.set("width", Json(double(image.w))); j.set("height", Json(double(image.h)));
+        const double plane = double(image.w) * double(image.h) * 3.0 * sizeof(float);
+        const bool supported = planes == 0 ||
+            (planes != kObserveOnly && std::strcmp(kRenderCore, "native-vulkan") == 0 &&
+             !p.settings.striped && !p.film_render.overscan.active);
+        j.set("estimate_available", Json(supported));
+        if (supported) {
+            const double scratch = plane * planes;
+            j.set("estimated_additional_live_bytes", Json(scratch));
+            j.set("estimated_pool_live_peak_bytes", Json(double(before.live_bytes) + scratch));
+            j.set("estimated_new_allocation_bytes", Json(std::max(0.0, scratch - double(before.free_bytes))));
+        }
+        j.set("grain", Json(p.film_render.grain.active));
+        j.set("halation", Json(p.film_render.halation.active));
+        j.set("glare", Json(p.print_render.glare.active));
+        j.set("striped", Json(p.settings.striped));
+        j.set("overscan", Json(p.film_render.overscan.active));
+        j.set("pool_live_bytes", Json(double(now.live_bytes)));
+        j.set("pool_free_bytes", Json(double(now.free_bytes)));
+        j.set("persistent_bytes", Json(double(now.persistent_bytes)));
+        j.set("observed_frame_high_water_bytes", Json(double(now.frame_high_water_bytes)));
+        j.set("frame_high_water_before_bytes", Json(double(before.frame_high_water_bytes)));
+        if (std::strcmp(event, "end") == 0) {
+            j.set("success", Json(success));
+            if (planes == kObserveOnly) j.set("output_payload_bytes", Json(double(output_payload_bytes)));
+            j.set("stage_peak_available", Json(observation != 0));
+            if (observation) {
+                j.set("observed_stage_live_peak_bytes", Json(double(measured.live_peak)));
+                j.set("observed_stage_requested_live_peak_bytes", Json(double(measured.requested_live_peak)));
+                j.set("requested_bytes_at_capacity_peak", Json(double(measured.requested_at_live_peak)));
+                j.set("observed_stage_resident_peak_bytes", Json(double(measured.resident_peak)));
+            }
+        }
+#ifdef _WIN32
+        MEMORYSTATUSEX status{}; status.dwLength = sizeof(status);
+        if (GlobalMemoryStatusEx(&status)) {
+            j.set("system_commit_available_bytes", Json(double(status.ullAvailPageFile)));
+            j.set("system_physical_available_bytes", Json(double(status.ullAvailPhys)));
+        }
+#endif
+        // Staging, driver memory, readback and file encoding are not covered.
+        std::fprintf(stderr, "memory_estimate %s\n", j.dump().c_str());
+    }
+};
+
 bool run_film_for(spk_session* session, const Image& source, Image& negative,
                   Progress* progress, std::string& error) {
+    MemoryEstimateTrace trace(session, "film", "miss", source, 5);
     if (session->params.settings.striped) {
-        return session->pipeline->run_film_striped(source, negative, progress, error);
+        return trace.success = session->pipeline->run_film_striped(source, negative, progress, error);
     }
-    return session->pipeline->run_film(source, negative, progress, error);
+    return trace.success = session->pipeline->run_film(source, negative, progress, error);
 }
 
 bool run_print_for(spk_session* session, const Image& negative, Image& rgb,
                    Progress* progress, std::string& error) {
+    // Conservative cross-size model: IIR glare can still need four RGB planes;
+    // consuming the default FIR field lowers that path to three. Pool
+    // oversizing and small-frame fixed costs remain outside this model.
+    MemoryEstimateTrace trace(session, "print", "miss", negative,
+                              session->params.print_render.glare.active ? 4 : 3);
     if (session->params.settings.striped) {
-        return session->pipeline->run_print_striped(negative, rgb, progress, error);
+        return trace.success = session->pipeline->run_print_striped(negative, rgb, progress, error);
     }
-    return session->pipeline->run_print(negative, rgb, progress, error);
+    return trace.success = session->pipeline->run_print(negative, rgb, progress, error);
 }
 
 bool negative_for(spk_session* session, const Tier& tier, Progress* progress, Image& out,
                   std::string& error) {
     spk_session::TierState& state = session->tiers[tier.name];
     if (state.has_negative) {
+        MemoryEstimateTrace trace(session, "film", "hit", state.negative, 0);
+        trace.success = true;
         if (progress) progress->auto_exposure_ev = state.applied_ev;
         out = state.negative;
         return true;
@@ -1113,8 +1246,8 @@ bool negative_for(spk_session* session, const Tier& tier, Progress* progress, Im
     session->pipeline->overscan_frame(state.overscan_frame_w, state.overscan_frame_h);
     if (progress) progress->auto_exposure_ev = state.applied_ev;
     // The negative is what every subsequent slider drag reprints from, so it
-    // has to outlive the frame arena. Copying it here is also what makes a
-    // reprint grain-consistent for free: the realisation is baked in and is
+    // has to outlive the frame arena. Keeping it also makes a reprint
+    // grain-consistent for free: the realisation is baked in and is
     // never redrawn.
     gpu::Gpu* gpu = session->engine->gpu;
     if (!gpu->flush(error)) return false;
@@ -1123,12 +1256,18 @@ bool negative_for(spk_session* session, const Tier& tier, Progress* progress, Im
     // The cached negative is the other holding RFC-020 §4.7 names: every
     // reprint reads it, it lives as long as the session, and at the full
     // tier it is the second 1.22 GB plane.
-    kept.buf = gpu->alloc_file_backed(negative.bytes(), error);
-    if (!kept.buf || !gpu->copy(kept.buf.get(), 0, negative.buf.get(), 0,
-                                negative.bytes(), error)) return false;
-    state.negative = kept;
+    if (gpu->try_promote_persistent(negative.buf.get(), negative.bytes())) {
+        // Vulkan can keep this exclusive, exact-size result without a second
+        // plane. Other backends retain their file-backed copy semantics.
+        kept = std::move(negative);
+    } else {
+        kept.buf = gpu->alloc_file_backed(negative.bytes(), error);
+        if (!kept.buf || !gpu->copy(kept.buf.get(), 0, negative.buf.get(), 0,
+                                    negative.bytes(), error)) return false;
+    }
+    state.negative = std::move(kept);
     state.has_negative = true;
-    out = kept;
+    out = state.negative;
     return true;
 }
 
@@ -1146,6 +1285,9 @@ bool negative_for(spk_session* session, const Tier& tier, Progress* progress, Im
 // as the caller is looking at them.
 bool materialise(spk_session* session, const Image& rgb, spk_result* out, std::string& error) {
     gpu::Gpu* gpu = session->engine->gpu;
+    // LUT previews and normalized DI also arrive here without run_print.
+    // Bound their idle scratch before allocating the persistent packed result.
+    if (!gpu->trim_idle_for_phase(rgb.bytes(), rgb.bytes(), error)) return false;
     const uint32_t align = gpu->texture_row_alignment_px();
     const uint32_t stride = ((rgb.w + align - 1) / align) * align;
     const size_t bytes = size_t(stride) * rgb.h * 4 * sizeof(uint16_t);
@@ -1193,19 +1335,16 @@ spk_status render_tier(spk_session* session, const char* tier_name, bool use_rep
 
     gpu::Gpu* gpu = session->engine->gpu;
     const auto started = std::chrono::steady_clock::now();
-#ifndef __APPLE__
-    // Windows has dedicated VRAM: inactive preview tiers are disposable
-    // caches, not edits. Keep only the tier this render/export actually needs.
-    // Returned Vulkan results own CPU pixels and are unaffected by eviction.
-    for (auto it = session->tiers.begin(); it != session->tiers.end();) {
-        if (it->first != tier->name) it = session->tiers.erase(it);
-        else ++it;
-    }
-#endif
     session->progress = Progress{};
     session->progress.progress_id = "p" + std::to_string(next_id());
     // Opt-in, because turning it on serialises every node. See Progress.
     session->progress.detailed = std::getenv("SPEKTRAFILM_NODE_TIMINGS") != nullptr;
+
+#ifndef __APPLE__
+    // A legacy explicit render requests a new print, so no later desktop
+    // view may reuse the result from before that request.
+    session->tiers[tier->name].view_print = Image{};
+#endif
 
     gpu->begin_frame();
     // RFC-020 §3.2, after the frame marker so that an event arriving as this
@@ -1230,8 +1369,7 @@ spk_status render_tier(spk_session* session, const char* tier_name, bool use_rep
     // may be one the *previous* pipeline made.
     Image tier_source;
     bool ok = tier_image(session, *tier, tier_source, error);
-    if (ok) session->pipeline->set_source_long_edge(std::max(tier_source.h, tier_source.w),
-                                                  std::max(session->source.h, session->source.w));
+    if (ok) session->pipeline->set_source_shape(tier_source.w, tier_source.h, session->source.w, session->source.h);
     if (ok) ok = negative_for(session, *tier, &session->progress, negative, error);
     // After the negative, which a film run lays out for itself: this is for
     // the cached one, whose layout the pipeline may never have made (a
@@ -1242,11 +1380,6 @@ spk_status render_tier(spk_session* session, const char* tier_name, bool use_rep
     }
     if (ok) ok = run_print_for(session, negative, rgb, &session->progress, error);
     if (ok) ok = materialise(session, rgb, out, error);
-    // Return temporaries before the backend's end-of-frame cache cleanup,
-    // including on failure. The cached negative and owned result remain live.
-    negative = Image{};
-    rgb = Image{};
-    tier_source = Image{};
     gpu->end_frame();
 
     if (!ok) {
@@ -1274,6 +1407,623 @@ spk_status spk_render(spk_session* session, const char* tier, spk_result* out) {
 }
 
 }  // extern "C"
+
+#ifndef __APPLE__
+namespace {
+constexpr size_t kResidencyChunkBytes = 8u * 1024u * 1024u;
+
+std::FILE* residency_file(std::string& error) {
+#if defined(_WIN32)
+    // CRT tmpfile() can choose the drive root on Windows. Use the user's
+    // Unicode temp directory and an exclusive, kernel-delete-on-close file.
+    std::vector<wchar_t> temp(32768);
+    const DWORD n = GetTempPathW(DWORD(temp.size()), temp.data());
+    if (!n || n >= temp.size()) {
+        error = "residency: cannot locate temporary directory"; return nullptr;
+    }
+    static std::atomic<uint64_t> serial{0};
+    for (unsigned attempt = 0; attempt < 32; ++attempt) {
+        const auto name = std::wstring(temp.data(), n) + L"spektralab-residency-" +
+            std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) +
+            L"-" + std::to_wstring(++serial) + L".tmp";
+        HANDLE handle = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            const auto code = GetLastError();
+            if (code == ERROR_FILE_EXISTS || code == ERROR_ALREADY_EXISTS) continue;
+            error = "residency: cannot create temporary file (Windows " + std::to_string(code) + ")";
+            return nullptr;
+        }
+        const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_RDWR | _O_BINARY);
+        if (fd < 0) { CloseHandle(handle); error = "residency: cannot open temporary stream"; return nullptr; }
+        auto* file = _fdopen(fd, "w+b");
+        if (!file) { _close(fd); error = "residency: cannot wrap temporary stream"; }
+        return file;
+    }
+    error = "residency: cannot create a unique temporary file"; return nullptr;
+#else
+    auto* file = std::tmpfile();
+    if (!file) error = "residency: cannot create temporary file: " + std::string(std::strerror(errno));
+    return file;
+#endif
+}
+
+// Explicit test-only fault injection exercises rollback after allocation and
+// I/O, rather than merely failing to open a file. Never enabled by app settings.
+bool residency_fault(const char* point) {
+    const char* value = std::getenv("SPK_TEST_RESIDENCY_FAILURE");
+    return value && std::strcmp(value, point) == 0;
+}
+}
+
+bool spk::view::suspended(spk_session* session) {
+    if (!session) return false;
+    std::lock_guard<std::mutex> guard(session->lock);
+    return bool(session->residency);
+}
+
+bool spk::view::suspend(spk_session* session, std::string& error) {
+    if (!session) { error = "residency: session is null"; return false; }
+    std::lock_guard<std::mutex> guard(session->lock);
+    if (session->residency) return true;
+    try {
+        using Snapshot = spk_session::ResidencySnapshot;
+        auto snapshot = std::make_unique<Snapshot>();
+        auto* gpu = session->engine->gpu;
+        if (!gpu->flush(error)) return false;
+        std::vector<gpu::Buffer*> buffers;
+        std::unordered_map<gpu::Buffer*, size_t> indices;
+        const auto capture = [&](const Image& image) {
+            Snapshot::Slot slot; slot.h = image.h; slot.w = image.w; slot.c = image.c;
+            if (image.buf) {
+                auto [it, added] = indices.emplace(image.buf.get(), buffers.size());
+                slot.plane = it->second;
+                if (added) {
+                    buffers.push_back(image.buf.get());
+                    snapshot->planes.push_back({gpu->size_bytes(image.buf.get())});
+                }
+            }
+            return slot;
+        };
+        snapshot->source = capture(session->source);
+        for (const auto& [name, tier] : session->tiers)
+            snapshot->tiers.emplace(name, Snapshot::TierSlots{
+                capture(tier.image), capture(tier.negative), capture(tier.view_print)});
+        snapshot->file.reset(residency_file(error));
+        if (!snapshot->file) return false;
+        std::vector<uint8_t> chunk(kResidencyChunkBytes);
+        bool wrote = false;
+        for (size_t p = 0; p < buffers.size(); ++p) {
+            const size_t size = snapshot->planes[p].bytes;
+            for (size_t offset = 0; offset < size;) {
+                const size_t n = std::min(chunk.size(), size - offset);
+                if (!gpu->read(buffers[p], offset, chunk.data(), n, error)) return false;
+                if ((wrote && residency_fault("write")) ||
+                    std::fwrite(chunk.data(), 1, n, snapshot->file.get()) != n) {
+                    error = "residency: failed to write temporary image; GPU data retained"; return false;
+                }
+                wrote = true; offset += n;
+            }
+        }
+        if (std::fflush(snapshot->file.get()) != 0) {
+            error = "residency: failed to flush temporary image; GPU data retained"; return false;
+        }
+        // The complete disk snapshot is recoverable before any original
+        // handle is dropped. Shapes, cache flags and pipeline state survive.
+        session->source.buf.reset();
+        for (auto& [name, tier] : session->tiers) {
+            tier.image.buf.reset(); tier.negative.buf.reset(); tier.view_print.buf.reset();
+        }
+        session->residency = std::move(snapshot);
+        return true;
+    } catch (const std::exception& e) {
+        error = std::string("residency: suspend failed: ") + e.what(); return false;
+    }
+}
+
+bool spk::view::resume(spk_session* session, std::string& error) {
+    if (!session) { error = "residency: session is null"; return false; }
+    std::lock_guard<std::mutex> guard(session->lock);
+    if (!session->residency) return true;
+    try {
+        auto& snapshot = *session->residency;
+        // Hosts resume before mutating a session. Refuse an invalid caller
+        // rather than resurrecting caches belonging to a different snapshot.
+        if (snapshot.tiers.size() != session->tiers.size()) {
+            error = "residency: suspended session was modified"; return false;
+        }
+        for (const auto& [name, slots] : snapshot.tiers)
+            if (session->tiers.find(name) == session->tiers.end()) {
+                error = "residency: suspended tier was removed"; return false;
+            }
+        std::clearerr(snapshot.file.get());
+        if (std::fseek(snapshot.file.get(), 0, SEEK_SET) != 0) {
+            error = "residency: cannot rewind temporary image"; return false;
+        }
+        auto* gpu = session->engine->gpu;
+        std::vector<gpu::BufferRef> restored;
+        restored.reserve(snapshot.planes.size());
+        std::vector<uint8_t> chunk(kResidencyChunkBytes);
+        bool read = false;
+        for (const auto& plane : snapshot.planes) {
+            auto destination = gpu->alloc_persistent(plane.bytes, error);
+            if (!destination) return false;
+            for (size_t offset = 0; offset < plane.bytes;) {
+                const size_t n = std::min(chunk.size(), plane.bytes - offset);
+                if ((read && residency_fault("read")) ||
+                    std::fread(chunk.data(), 1, n, snapshot.file.get()) != n) {
+                    error = "residency: failed to read temporary image; disk snapshot retained"; return false;
+                }
+                // The upload staging is bounded. A persistent chunk avoids
+                // borrowing an oversized free render plane from the pool.
+                auto upload = gpu->upload_persistent(chunk.data(), n, error);
+                if (!upload || !gpu->copy(destination.get(), offset, upload.get(), 0, n, error)) return false;
+                read = true; offset += n;
+            }
+            restored.push_back(std::move(destination));
+        }
+        const auto install = [&](Image& image, const spk_session::ResidencySnapshot::Slot& slot) {
+            image.h = slot.h; image.w = slot.w; image.c = slot.c;
+            image.buf = slot.plane == size_t(-1) ? gpu::BufferRef{} : restored[slot.plane];
+        };
+        // Commit only after every allocation and read succeeded. Until here,
+        // RAII releases any partial GPU restoration and the file stays valid.
+        install(session->source, snapshot.source);
+        for (const auto& [name, slots] : snapshot.tiers) {
+            auto& tier = session->tiers.at(name);
+            install(tier.image, slots.image); install(tier.negative, slots.negative);
+            install(tier.view_print, slots.view_print);
+        }
+        session->residency.reset();
+        return true;
+    } catch (const std::exception& e) {
+        error = std::string("residency: resume failed: ") + e.what(); return false;
+    }
+}
+
+bool spk::view::render_source(spk_session* session, uint32_t long_edge, const std::string& display,
+                              Result& result, std::string& error, bool rgba16) {
+    if (!session || (display != "sRGB" && display != "Display P3") || long_edge > 65536) {
+        error = "source: invalid session, size or display space"; return false;
+    }
+    if (!resume(session, error)) return false;
+    std::lock_guard<std::mutex> guard(session->lock);
+    if (session->params.io.input_color_space != "ProPhoto RGB" || session->params.io.input_cctf_decoding) {
+        error = "source: expected the desktop linear ProPhoto input"; return false;
+    }
+    auto* gpu = session->engine->gpu;
+    gpu->begin_frame();
+    struct EndFrame { gpu::Gpu* gpu; ~EndFrame() { gpu->end_frame(); } } end{gpu};
+    const auto start = std::chrono::steady_clock::now();
+    Image source;
+    if (!downscale(gpu, session->source, long_edge, source, error) || !gpu->flush(error)) return false;
+    Mat3 matrix;
+    if (!session->engine->colour.matrix_RGB_to_RGB("ProPhoto RGB", display, "CAT02", matrix, error)) return false;
+    double row[9]; matrix.to_row_major(row); float column[9];
+    for (size_t r = 0; r < 3; ++r) for (size_t c = 0; c < 3; ++c) column[r * 3 + c] = float(row[c * 3 + r]);
+    // Restore the Windows original-view policy: map destination chroma before
+    // packing, rather than clipping different saturated colours to one code.
+    // Keep the decoded scene unchanged and never add a second lightness knee.
+    char* text = nullptr; const float* cmax = nullptr; uint32_t count = 0;
+    if (spk_output_transform(session->engine, "ProPhoto RGB", display.c_str(),
+            "{\"lightness_compression_active\":false}", &text, &cmax, &count) != SPK_OK) {
+        error = spk_last_error(session->engine); return false;
+    }
+    Json transform; const bool parsed = Json::parse(text, transform, error); spk_string_free(text);
+    if (!parsed) return false;
+    const Json& gc = transform.at("gamut_compress");
+    auto numbers = [](const Json& j) { std::vector<float> out; for (const auto& n : j.items()) out.push_back(float(n.as_double())); return out; };
+    auto mx = numbers(gc.at("m_to_xyz")), mr = numbers(gc.at("m_to_rgb")), k = numbers(gc.at("k"));
+    if (mx.size()!=9 || mr.size()!=9 || k.size()!=22 || !cmax || !count) { error="source: invalid destination gamut table"; return false; }
+    auto linear = gpu->alloc(source.bytes(), error), mapped = gpu->alloc(source.bytes(), error);
+    auto table = gpu->upload(cmax, size_t(count)*sizeof(float), error);
+    if (!linear || !mapped || !table) return false;
+    uint32_t pixels = uint32_t(source.pixels());
+    if (!gpu->dispatch("spk_matmul3", {gpu::Arg::buf(source.buf), gpu::Arg::inline_bytes(column,9),
+            gpu::Arg::inline_bytes(&pixels,1), gpu::Arg::buf(linear)}, pixels,error) || !gpu->flush(error)) return false;
+    uint32_t gamut_meta[] = {pixels, uint32_t(gc.at("cmax_rows").as_int()), uint32_t(gc.at("cmax_cols").as_int()), 0};
+    if (!gpu->dispatch("spk_cam16ucs_compress", {gpu::Arg::buf(linear), gpu::Arg::inline_bytes(mx.data(),9),
+            gpu::Arg::inline_bytes(mr.data(),9), gpu::Arg::buf(table), gpu::Arg::inline_bytes(k.data(),22),
+            gpu::Arg::inline_bytes(gamut_meta,4), gpu::Arg::buf(mapped)}, pixels,error) || !gpu->flush(error)) return false;
+    linear.reset(); table.reset();
+    std::fill(std::begin(column),std::end(column),0.f); column[0]=column[4]=column[8]=1.f;
+    auto encoded = gpu->alloc(source.bytes(), error);
+    if (!encoded) return false;
+    uint32_t meta[] = {uint32_t(source.pixels()), 0}; // sRGB/P3 share the sRGB OETF
+    if (!gpu->dispatch("spk_cctf_encode_matrix", {gpu::Arg::buf(mapped), gpu::Arg::inline_bytes(column, 9),
+            gpu::Arg::inline_bytes(meta, 2), gpu::Arg::buf(encoded)}, source.pixels(), error) || !gpu->flush(error)) return false;
+    mapped.reset();
+    const size_t packed_bytes = source.pixels() * (rgba16 ? 8u : 4u);
+    auto packed = gpu->alloc(packed_bytes, error);
+    auto stats = gpu->alloc_zeroed(12, error);
+    if (!packed || !stats) return false;
+    uint32_t packing[] = {uint32_t(source.pixels()), 4, rgba16 ? 16u : 8u, 4, 0};
+    if (!gpu->dispatch("spk_view_pack", {gpu::Arg::buf(encoded), gpu::Arg::inline_bytes(packing, 5),
+            gpu::Arg::buf(packed), gpu::Arg::buf(stats)}, source.pixels(), error) || !gpu->flush(error)) return false;
+    Result next;
+    next.post_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const auto read = std::chrono::steady_clock::now();
+    next.pixels.resize(packed_bytes);
+    if (!gpu->read(packed.get(), 0, next.pixels.data(), next.pixels.size(), error)) return false;
+    next.readback_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - read).count();
+    next.width = source.w; next.height = source.h;
+    next.source_width = session->source.w; next.source_height = session->source.h;
+    result = std::move(next); return true;
+}
+
+bool spk::view::sample_source(spk_session* session, double x, double y, SourceSample& result, std::string& error) {
+    if (!session || !std::isfinite(x) || !std::isfinite(y) || x < 0 || x > 1 || y < 0 || y > 1) {
+        error = "neutral pick: invalid normalized source coordinates"; return false;
+    }
+    if (!resume(session, error)) return false;
+    std::lock_guard<std::mutex> guard(session->lock);
+    const auto& image = session->source;
+    if (!image.valid() || image.c != 3) { error = "neutral pick: no decoded RGB source"; return false; }
+    auto* gpu = session->engine->gpu;
+    if (!gpu->flush(error)) return false;
+    const int cx = std::min(int(image.w) - 1, int(x * image.w));
+    const int cy = std::min(int(image.h) - 1, int(y * image.h));
+    const int x0 = std::max(0, cx - 2), x1 = std::min(int(image.w) - 1, cx + 2);
+    const int y0 = std::max(0, cy - 2), y1 = std::min(int(image.h) - 1, cy + 2);
+    SourceSample next;
+    next.minimum.fill(std::numeric_limits<double>::infinity());
+    next.maximum.fill(-std::numeric_limits<double>::infinity());
+    for (int row = y0; row <= y1; ++row) {
+        std::array<float, 15> values{};
+        if (!gpu->read(image.buf.get(), (size_t(row) * image.w + x0) * 3 * sizeof(float),
+                       values.data(), size_t(x1 - x0 + 1) * 3 * sizeof(float), error)) return false;
+        for (int px = 0; px <= x1 - x0; ++px) {
+            for (int c = 0; c < 3; ++c) {
+                double v = values[size_t(px) * 3 + c];
+                if (!std::isfinite(v)) { error = "neutral pick: source contains a non-finite value"; return false; }
+                next.mean[c] += v; next.minimum[c] = std::min(next.minimum[c], v); next.maximum[c] = std::max(next.maximum[c], v);
+            }
+            ++next.samples;
+        }
+    }
+    for (double& v : next.mean) v /= next.samples;
+    result = next; return true;
+}
+
+// One shipped view table per engine. Match Mac's binary16 texture values;
+// interpolation and grading remain float32 and share one UNORM16 boundary.
+static bool di_view_table(spk_engine* engine, gpu::BufferRef& table, std::string& error) {
+    constexpr const char* key = "@di-view-prophoto-65";
+    auto found = engine->print_lut_buffers.find(key);
+    if (found != engine->print_lut_buffers.end()) { table = found->second; return true; }
+    std::ifstream input(file_path(engine->resources_dir + "/DI/SpektraLab DI view, Cineon to ProPhoto RGB.cube"));
+    if (!input) { error = "DI view LUT is missing from engine resources"; return false; }
+    std::vector<float> values; values.reserve(65 * 65 * 65 * 3);
+    std::string line; int size = 0;
+    while (std::getline(input, line)) {
+        std::istringstream row(line); std::string token; row >> token;
+        if (token == "LUT_3D_SIZE") { row >> size; continue; }
+        if (token.empty() || (token[0] != '-' && token[0] != '.' && (token[0] < '0' || token[0] > '9'))) continue;
+        row.clear(); row.str(line);
+        float v[3]; std::string extra;
+        if (!(row >> v[0] >> v[1] >> v[2]) || (row >> extra)) { error = "DI view LUT has an invalid row"; return false; }
+        for (float x : v) {
+            if (!std::isfinite(x) || x < 0 || x > 1) { error = "DI view LUT has an invalid value"; return false; }
+            int exponent = 0; std::frexp(x, &exponent);
+            const float step = std::ldexp(1.0f, std::max(-24, exponent - 11));
+            const float scaled = x / step, lo = std::floor(scaled), fraction = scaled - lo;
+            values.push_back((lo + (fraction > .5f || (fraction == .5f && std::fmod(lo, 2.f) != 0) ? 1.f : 0.f)) * step);
+        }
+    }
+    if (size != 65 || values.size() != 65 * 65 * 65 * 3) { error = "DI view LUT has an invalid grid"; return false; }
+    table = engine->gpu->upload_persistent(values.data(), values.size() * sizeof(float), error);
+    if (!table) return false;
+    engine->print_lut_buffers[key] = table;
+    return true;
+}
+
+// Mac Session.pairLayered: one negative, independent print trims and grades,
+// then a single feathered composite. The session's frozen film state is never
+// rewritten, and no intermediate image crosses the CPU boundary.
+static bool pair_layers(spk_session* session, const Tier& tier, const Image& source,
+                        const spk::view::Request& request, const gpu::BufferRef& di_lut,
+                        Image& print, bool& layered, double& print_ms, double& post_ms,
+                        std::string& error) {
+    using namespace spk;
+    layered = false;
+    if (request.pair.is_null() || request.cineon) return true;
+    try {
+        if (!request.pair.is_object()) throw std::runtime_error("pair must be an object");
+        struct Layer { bool printed = false, graded = false; Json delta = Json::object(), grade; } layers[2];
+        const char* names[] = {"left", "right"};
+        const char* keys[] = {"print_exposure", "y_filter_shift", "m_filter_shift", "preflash_exposure"};
+        const double film[] = {session->params.enlarger.print_exposure, session->params.enlarger.y_filter_shift,
+                               session->params.enlarger.m_filter_shift, session->params.enlarger.preflash_exposure};
+        Json restore = Json::object(); for (int i=0;i<4;++i) restore.set(keys[i], Json(film[i]));
+        auto number = [&](const Json& obj, const char* name, double lo, double hi) {
+            if (!obj.has(name)) return 0.0;
+            const auto& n = obj.at(name); const double value = n.as_double();
+            if (!n.is_number() || !std::isfinite(value) || value<lo || value>hi)
+                throw std::runtime_error(std::string("invalid pair ")+name);
+            return value;
+        };
+        for (int side=0;side<2;++side) {
+            const auto& hole = request.pair.at(names[side]);
+            if (hole.is_null()) continue;
+            if (!hole.is_object()) throw std::runtime_error("pair hole must be an object or null");
+            auto& layer=layers[side]; layer.grade=request.adjustments;
+            if (hole.has("adjustments") && !hole.at("adjustments").is_null()) {
+                if (!hole.at("adjustments").is_object()) throw std::runtime_error("pair adjustments must be an object");
+                layer.grade=hole.at("adjustments"); layer.graded=layer.grade.dump()!=request.adjustments.dump();
+            }
+            const auto& trim=hole.at("print");
+            if (!trim.is_null()) {
+                if (!trim.is_object()) throw std::runtime_error("pair print must be an object");
+                const double values[]={std::clamp(std::pow(2.0,-number(trim,"brightnessStops",-20,20)),.05,20.0),
+                    number(trim,"yFilterShift",-1,1),number(trim,"mFilterShift",-1,1),
+                    request.pair.at("printEffects").as_bool(true)?number(trim,"preflashExposure",0,1):0.0};
+                for(int i=0;i<4;++i) { layer.delta.set(keys[i],Json(values[i])); layer.printed|=values[i]!=film[i]; }
+            }
+            layered|=layer.printed||layer.graded;
+        }
+        if (!layered) return true;
+        std::array<std::array<float,4>,2> rects{};
+        auto& state=session->tiers[tier.name];
+        session->pipeline->set_source_shape(source.w,source.h,session->source.w,session->source.h);
+        if(!session->pipeline->set_overscan_frame(state.overscan_frame_w,state.overscan_frame_h,error))return false;
+        Json gates=request.pair.at("gates");
+        if(session->params.film_render.overscan.active) {
+            Json layout;
+            if(!Json::parse(session->pipeline->overscan_geometry_json(),layout,error))return false;
+            gates=layout.at("gates");
+        }
+        if(!gates.is_array()||gates.items().size()!=2)throw std::runtime_error("pair layers require two gates");
+        for(size_t side=0;side<2;++side) {
+            const auto& gate=gates.items()[side];
+            if(!gate.is_array()||(gate.items().size()!=4&&gate.items().size()!=8))throw std::runtime_error("invalid pair gate");
+            double x0=1,y0=1,x1=0,y1=0;
+            for(size_t k=0;k<gate.items().size();k+=2) {
+                const auto& x=gate.items()[k];const auto& y=gate.items()[k+1];
+                if(!x.is_number()||!y.is_number()||!std::isfinite(x.as_double())||!std::isfinite(y.as_double()))
+                    throw std::runtime_error("invalid pair gate coordinate");
+                x0=std::min(x0,x.as_double());x1=std::max(x1,x.as_double());
+                y0=std::min(y0,y.as_double());y1=std::max(y1,y.as_double());
+            }
+            if(x0<0||y0<0||x1>1||y1>1||x0>=x1||y0>=y1)throw std::runtime_error("pair gate lies outside canvas");
+            rects[side]={float(x0*print.w),float(y0*print.h),float(x1*print.w),float(y1*print.h)};
+        }
+        const size_t axis=request.pair.at("turned").as_bool()?1:0;
+        if(rects[1][axis]<rects[0][axis])std::swap(rects[0],rects[1]);
+        auto* gpu=session->engine->gpu;
+        Json identity=Json::object();identity.set("source_color_space",Json(std::string("ProPhoto RGB")));
+        identity.set("target_color_space",Json(std::string("ProPhoto RGB")));
+        view::Request q; q.rgba16=true; q.target_space="ProPhoto RGB";
+        auto grade=[&](const Image& input,const Json& adjustments,Image& output) {
+            q.adjustments=adjustments; view::Result timing;
+            const bool ok=view::process(gpu,input,q,identity,nullptr,0,timing,error,di_lut,di_lut?65:0,&output);
+            post_ms+=timing.post_ms; return ok;
+        };
+        Image base, images[2];
+        if(!grade(print,request.adjustments,base))return false;
+        for(int side=0;side<2;++side) {
+            const auto& layer=layers[side];
+            if(!layer.printed&&!layer.graded){images[side]=base;continue;}
+            Image input=print;
+            if(layer.printed) {
+                const auto started=std::chrono::steady_clock::now();
+                Image negative,rgb;
+                if(!negative_for(session,tier,&session->progress,negative,error))return false;
+                struct RestorePrint { Pipeline* pipeline; const Json& values; ~RestorePrint(){pipeline->apply_live_delta(values);} } reset{session->pipeline.get(),restore};
+                session->pipeline->apply_live_delta(layer.delta);
+                if(!run_print_for(session,negative,rgb,&session->progress,error))return false;
+                input.w=rgb.w;input.h=rgb.h;input.c=2;input.buf=gpu->alloc(input.bytes(),error);
+                if(!input.buf)return false;
+                uint32_t m[]={uint32_t(rgb.pixels()),rgb.w,rgb.w};
+                if(!gpu->dispatch("spk_to_rgba16",{gpu::Arg::buf(rgb.buf),gpu::Arg::inline_bytes(m,3),gpu::Arg::buf(input.buf)},rgb.pixels(),error)||!gpu->flush(error))return false;
+                print_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+            }
+            if(!grade(input,layer.grade,images[side]))return false;
+        }
+        const auto started=std::chrono::steady_clock::now();
+        Image composite;composite.w=base.w;composite.h=base.h;composite.c=2;composite.buf=gpu->alloc(base.bytes(),error);
+        if(!composite.buf)return false;
+        const uint32_t meta[]={uint32_t(base.pixels()),base.w,(layers[0].printed||layers[0].graded)?1u:0u,(layers[1].printed||layers[1].graded)?1u:0u};
+        if(!gpu->dispatch("spk_view_pair",{gpu::Arg::buf(base.buf),gpu::Arg::buf(images[0].buf),gpu::Arg::buf(images[1].buf),
+            gpu::Arg::inline_bytes(meta,4),gpu::Arg::inline_bytes(rects[0].data(),8),gpu::Arg::buf(composite.buf)},base.pixels(),error)||!gpu->flush(error))return false;
+        post_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+        print=std::move(composite);return true;
+    } catch(const std::exception& e){error=std::string("view: ")+e.what();return false;}
+}
+
+bool spk::view::render(spk_session* session, const Request& request, Result& result,
+                       std::string& error) {
+    result = Result{};
+    if (!session) { error = "view: session is null"; return false; }
+    if (!resume(session, error)) return false;
+    const Tier* tier = find_tier(request.tier.c_str());
+    if (!tier) { error = "view: unknown tier"; return false; }
+    if (request.target_space != "sRGB" && request.target_space != "Display P3" && request.target_space != "ProPhoto RGB" &&
+        request.target_space != "Adobe RGB (1998)" && request.target_space != "ITU-R BT.2020") {
+        error = "view: unknown target space"; return false;
+    }
+    std::lock_guard<std::mutex> guard(session->lock);
+    if (request.no_film && request.cineon) { error = "view: no_film cannot write a Digital Intermediate"; return false; }
+    const bool no_film = request.no_film;
+    if (no_film && (!request.pair.is_null() || session->params.film_render.overscan.pair)) {
+        error = "view: no_film is unavailable for a half-frame pair"; return false;
+    }
+    if (no_film && (session->params.io.input_color_space != "ProPhoto RGB" || session->params.io.input_cctf_decoding)) {
+        error = "view: no_film requires the desktop linear ProPhoto source"; return false;
+    }
+    if (session->params.io.output_color_space != "ProPhoto RGB" || !session->params.io.output_cctf_encoding) {
+        error = "view: the desktop postprocess requires encoded ProPhoto RGB"; return false;
+    }
+    auto* gpu = session->engine->gpu;
+    gpu->begin_frame();
+    struct EndFrame { gpu::Gpu* gpu; ~EndFrame() { gpu->end_frame(); } } end{gpu};
+    session->progress = Progress{};
+    session->progress.progress_id = "p" + std::to_string(next_id());
+    session->progress.detailed = std::getenv("SPEKTRAFILM_NODE_TIMINGS") != nullptr;
+    session->progress.memory_pressure_critical = gpu->take_critical_pressure();
+    if (session->progress.memory_pressure_critical)
+        for (auto& kv : session->tiers) kv.second.view_print = Image{};
+    auto started = std::chrono::steady_clock::now();
+    // tier_image may replace the tier state if preview_long_edge changed.
+    Image source;
+    if (!tier_image(session, *tier, source, error)) return false;
+    auto& state = session->tiers[tier->name];
+    uint32_t full_w = 0, full_h = 0;
+    if (no_film) { full_w = session->source.w; full_h = session->source.h; }
+    else if (!session->pipeline->full_output_size(session->source.w, session->source.h, full_w, full_h, error)) return false;
+    result.print_cached = !no_film && !request.cineon && state.view_print.valid();
+    Image packed_print;
+    if (no_film) {
+        // Film geometry, exposure and randomness do not own the decode. Encode
+        // it as float RGB: premature RGBA16 packing would clip RAW highlights
+        // before a negative Post-Dev exposure could recover them. process()
+        // shares the same grade/geometry/output path and its normal boundary.
+        packed_print.w = source.w; packed_print.h = source.h; packed_print.c = 3;
+        packed_print.buf = gpu->alloc(source.bytes(), error);
+        if (!packed_print.buf) return false;
+        const float identity[] = {1,0,0,0,1,0,0,0,1};
+        const uint32_t meta[] = {uint32_t(source.pixels()), 1}; // ProPhoto OETF
+        if (!gpu->dispatch("spk_cctf_encode_matrix", {gpu::Arg::buf(source.buf), gpu::Arg::inline_bytes(identity, 9),
+                gpu::Arg::inline_bytes(meta, 2), gpu::Arg::buf(packed_print.buf)}, source.pixels(), error) || !gpu->flush(error)) return false;
+    } else if (!result.print_cached) {
+        session->pipeline->set_source_shape(source.w, source.h, session->source.w, session->source.h);
+        Image negative, rgb;
+        if (!negative_for(session, *tier, &session->progress, negative, error)) return false;
+        if (request.cineon) {
+            if (session->params.film.info.is_positive()) { error = "a slide film has no Digital Intermediate"; return false; }
+            Params params = session->params; params.io.digital_intermediate = true; params.io.scan_film = false;
+            Pipeline pipeline(gpu, &session->engine->colour, &session->engine->blob, &session->engine->setup_cache);
+            if (!pipeline.build(params, error)) return false;
+            pipeline.set_source_shape(source.w, source.h, session->source.w, session->source.h);
+            if (!pipeline.set_overscan_frame(state.overscan_frame_w, state.overscan_frame_h, error) ||
+                !(params.settings.striped ? pipeline.run_print_striped(negative, rgb, &session->progress, error)
+                                          : pipeline.run_print(negative, rgb, &session->progress, error))) return false;
+        } else if (!session->pipeline->set_overscan_frame(state.overscan_frame_w, state.overscan_frame_h, error) ||
+                   !run_print_for(session, negative, rgb, &session->progress, error)) return false;
+        Image packed; packed.w = rgb.w; packed.h = rgb.h; packed.c = 2;
+        packed.buf = gpu->alloc_persistent(packed.bytes(), error);
+        if (!packed.buf) return false;
+        uint32_t meta[] = {uint32_t(rgb.pixels()), rgb.w, rgb.w};
+        if (!gpu->dispatch("spk_to_rgba16", {gpu::Arg::buf(rgb.buf), gpu::Arg::inline_bytes(meta, 3), gpu::Arg::buf(packed.buf)},
+                           rgb.pixels(), error) || !gpu->flush(error)) return false;
+        packed_print = std::move(packed);
+        if (!request.cineon) state.view_print = packed_print;
+    } else {
+        packed_print = state.view_print;
+        MemoryEstimateTrace trace(session, "print", "hit", packed_print, 0);
+        trace.success = true;
+        session->progress.auto_exposure_ev = state.applied_ev;
+    }
+    result.print_ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+    Json transform = Json::object(); const float* cmax = nullptr; uint32_t count = 0;
+    auto display_transform = [&](const std::string& src, const std::string& dst, Json& transform)->bool {
+        const Colour& colour = session->engine->colour;
+
+        for (const auto& space : {src, dst}) {
+            const Colour::Colourspace* definition = nullptr;
+            if (!colour.colourspace(space, definition, error)) return false;
+            if (!colour.known_cctf(space)) {
+                error = "view: no transfer function baked for colour space '" + space + "'"; return false;
+            }
+            if (definition->whitepoint[1] == 0.0) {
+                error = "view: no whitepoint baked for colour space '" + space + "'"; return false;
+            }
+        }
+        Mat3 matrix;
+        if (!colour.matrix_RGB_to_RGB(src, dst, "CAT02", matrix, error)) return false;
+        double row[9]; matrix.to_row_major(row);
+        Json numbers = Json::array();
+        for (double v : row) numbers.push(Json(v));
+        transform.set("source_color_space", Json(src));
+        transform.set("target_color_space", Json(dst));
+        transform.set("source_cctf_mode", Json(double(cctf_mode_for(src))));
+        transform.set("target_cctf_mode", Json(double(cctf_mode_for(dst))));
+        transform.set("matrix", std::move(numbers));
+        Json compress = Json::object(); compress.set("algorithm", Json("off"));
+        transform.set("gamut_compress", std::move(compress));
+        return true;
+    };
+    gpu::BufferRef di_lut;
+    const bool di_view = !no_film && session->params.io.digital_intermediate && !session->params.io.scan_film &&
+                         !session->params.film.info.is_positive();
+    if ((request.cineon || di_view) && !di_view_table(session->engine, di_lut, error)) return false;
+    if (request.cineon) {
+        // The intermediate is where grading starts. Geometry is retained;
+        // Post-Dev and display/output RGB transforms never touch its codes.
+        Request raw = request; raw.adjustments = Json::object(); raw.adjustments.set("enabled", Json(false));
+        raw.export_intent = false; raw.proof_long_edge = 0; raw.rgba16 = true; raw.output_channels = 4;
+        raw.target_space = "ProPhoto RGB";
+        Json identity = Json::object(); identity.set("source_color_space", Json("ProPhoto RGB"));
+        identity.set("target_color_space", Json("ProPhoto RGB"));
+        Image file_codes;
+        if (!process(gpu, packed_print, raw, identity, nullptr, 0, result, error, {}, 0, &file_codes)) return false;
+        packed_print = Image{};
+        raw.geometry = Json::object(); raw.long_edge = 0;
+        if (!request.proof_long_edge) {
+            raw.output_channels = 3;
+            Result codes;
+            if (!process(gpu, file_codes, raw, identity, nullptr, 0, codes, error)) return false;
+            result.pixels = std::move(codes.pixels); result.post_ms += codes.post_ms; result.readback_ms += codes.readback_ms;
+        }
+        Request preview = raw; preview.rgba16 = false;
+        preview.long_edge = request.proof_long_edge ? request.proof_long_edge : 2048;
+        preview.target_space = request.proof_long_edge ? request.proof_display : "sRGB";
+        preview.output_channels = request.proof_long_edge ? 4 : 3;
+        Json display;
+        if (!display_transform("ProPhoto RGB", preview.target_space, display)) return false;
+        Result shown;
+        if (!process(gpu, file_codes, preview, display, nullptr, 0, shown, error, di_lut, 65)) return false;
+        result.post_ms += shown.post_ms; result.readback_ms += shown.readback_ms;
+        if (request.proof_long_edge) {
+            result.pixels = std::move(shown.pixels); result.width = shown.width; result.height = shown.height;
+        } else {
+            result.preview_rgb = std::move(shown.pixels); result.preview_width = shown.width; result.preview_height = shown.height;
+        }
+        result.source_width = full_w; result.source_height = full_h;
+        session->progress.done = true; return true;
+    }
+    bool pair_layered = false; double pair_print_ms = 0, pair_post_ms = 0;
+    if (!no_film && !pair_layers(session, *tier, source, request, di_lut, packed_print, pair_layered,
+                     pair_print_ms, pair_post_ms, error)) return false;
+    const bool map_display = request.target_space == "sRGB" || request.target_space == "Display P3";
+    if (request.export_intent || map_display) {
+        char* text = nullptr;
+        // The film print already applied the working-space lightness shoulder.
+        // Keep only the target chroma knee at file and SDR display boundaries.
+        if (spk_output_transform(session->engine, "ProPhoto RGB", request.target_space.c_str(), "{\"lightness_compression_active\":false}",
+                                 &text, &cmax, &count) != SPK_OK) {
+            error = spk_last_error(session->engine); return false;
+        }
+        bool parsed = Json::parse(text, transform, error); spk_string_free(text);
+        if (!parsed) return false;
+    } else if (!display_transform("ProPhoto RGB", request.target_space, transform)) return false;
+    if (request.proof_long_edge) {
+        if (!request.export_intent || (request.proof_display != "sRGB" && request.proof_display != "Display P3")) {
+            error = "view: invalid proof display request"; return false;
+        }
+        Json display = Json::object();
+        if (!display_transform(request.target_space, request.proof_display, display)) return false;
+        transform.set("proof", std::move(display));
+    }
+    Request final_request = request;
+    final_request.export_intent = request.export_intent || map_display;
+    if (pair_layered) final_request.adjustments.set("enabled", Json(false));
+    const gpu::BufferRef final_lut = pair_layered ? gpu::BufferRef{} : di_lut;
+    {
+        // Output shape/packing differ from the input: observe first, do not
+        // apply the RGB scratch model to output conversion or CPU readback.
+        MemoryEstimateTrace trace(session, request.export_intent ? "output-export" : "output-view",
+                                  "miss", packed_print, MemoryEstimateTrace::kObserveOnly);
+        trace.success = process(gpu, packed_print, final_request, transform, cmax, count, result, error, final_lut, final_lut ? 65 : 0);
+        trace.output_payload_bytes = result.pixels.size();
+        if (!trace.success) return false;
+    }
+    result.print_ms += pair_print_ms; result.post_ms += pair_post_ms;
+    result.source_width = full_w; result.source_height = full_h;
+    session->progress.done = true;
+    return true;
+}
+#endif
 
 // The LUT methods' helpers, outside the C block: they take and return C++
 // types, and a C-linkage function that returns a `Json` is a warning today
@@ -1322,8 +2072,7 @@ const PrintLut* prepare_lut(spk_session* session, const char* print_stock, const
     // The same ordering `render_tier` uses, and for the same reason: the film
     // side needs the frame's pixel pitch, and a pipeline rebuilt by a
     // print-layer edit has never seen one.
-    session->pipeline->set_source_long_edge(std::max(tier_source.h, tier_source.w),
-                                              std::max(session->source.h, session->source.w));
+    session->pipeline->set_source_shape(tier_source.w, tier_source.h, session->source.w, session->source.h);
     if (!negative_for(session, tier, &session->progress, negative, error)) return nullptr;
     return lut;
 }
@@ -1648,13 +2397,6 @@ spk_status spk_render_digital_intermediate(spk_session* session, spk_result* out
     std::lock_guard<std::mutex> guard(session->lock);
     g_error.clear();
     std::memset(out, 0, sizeof *out);
-#ifndef __APPLE__
-    if (const char* unported = windows_unported_error(true, false, false, false, false)) {
-        if (out_json) *out_json = nullptr;
-        g_error = unported;
-        return SPK_ERR_USER;
-    }
-#endif
     if (session->params.film.info.is_positive()) {
         g_error = "a slide film has no orange mask and no negative to reverse, so it has no "
                   "Digital Intermediate";
@@ -1680,13 +2422,11 @@ spk_status spk_render_digital_intermediate(spk_session* session, spk_result* out
     Pipeline pipeline(gpu, &engine->colour, &engine->blob, &engine->setup_cache);
     bool ok = tier_image(session, kTiers[2], tier_source, error);
     if (ok) {
-        const uint32_t edge = std::max(tier_source.h, tier_source.w);
-        const uint32_t frame = std::max(session->source.h, session->source.w);
-        session->pipeline->set_source_long_edge(edge, frame);
+        session->pipeline->set_source_shape(tier_source.w, tier_source.h, session->source.w, session->source.h);
         ok = negative_for(session, kTiers[2], &session->progress, negative, error) &&
              pipeline.build(params, error);
         if (ok) {
-            pipeline.set_source_long_edge(edge, frame);
+            pipeline.set_source_shape(tier_source.w, tier_source.h, session->source.w, session->source.h);
             const spk_session::TierState& state = session->tiers[kTiers[2].name];
             ok = pipeline.set_overscan_frame(state.overscan_frame_w, state.overscan_frame_h, error);
         }
@@ -1821,6 +2561,10 @@ spk_status spk_set_params(spk_session* session, const char* params_delta_json, c
 
     Json out = Json::object();
     out.set("invalidated", Json(std::string(shoot ? "shoot" : "print")));
+#ifndef __APPLE__
+    if (!delta.fields().empty())
+        for (auto& kv : session->tiers) kv.second.view_print = Image{};
+#endif
     out.set("params", read_params(session->params));
     if (out_json) *out_json = dup_json(out);
     return SPK_OK;
@@ -2359,6 +3103,23 @@ void spk_session_release(spk_session* session) {
     // Every buffer the session held is a counted handle, so destroying it is
     // all the releasing there is.
     delete session;
+#ifndef __APPLE__
+    // The discrete backend must not retain a multi-GB scratch arena after the
+    // last photograph closes. Keep the check and trim under the same engine
+    // lock as registration; retained C results own independent CPU memory.
+    std::lock_guard<std::mutex> guard(engine->lock);
+    if (engine->sessions.empty() && engine->gpu) {
+        engine->gpu->trim_pool(0);
+        engine->pool_frame_valid = false;
+    }
+#endif
 }
 
 }  // extern "C"
+
+#ifndef __APPLE__
+size_t spk::view::trim_idle_memory(spk_engine* engine) {
+    if (!engine || !engine->gpu) return 0;
+    return engine->gpu->trim_pool(0);
+}
+#endif

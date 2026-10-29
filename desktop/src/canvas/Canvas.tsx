@@ -8,6 +8,7 @@
 // whatever tier is on the canvas (§7.3: zoom selects no tier).
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { openDialog, openFolderDialog } from '../windows/actions';
 import {
   type Geometry,
   type Point,
@@ -24,26 +25,45 @@ import {
   CROP_HANDLES,
   isCorner,
   rotated,
+  straightened,
+  straightenAngle,
 } from '@shared/geometry';
 import { clamp } from '@shared/params';
+import { canvasGeometryFor, geometryInNegative, sourceGeometryFor } from '@shared/filmEdge';
+import { draggedPlacement, pairAspect, pairRects, PAIR_SIDES, PLACEMENT_DEFAULT, zoomedPlacement, type PairPlacement, type PairRect, type PairSide } from '@shared/pair';
 import { GLRenderer, type DrawState } from './glRenderer';
 import { frameImages } from '../state/frames';
 import {
   beginGesture,
+  choosePairHole,
+  click,
+  commitPairPlacement,
+  pairCanvasRects,
+  setPairHole,
+  setPairLayer,
+  setPairPlacement,
+  togglePairPlacing,
   noteFitZoom,
   noteCanvasPx,
+  noteDisplaySpace,
+  noteTextureLimit,
+  notePreviewDrawn,
+  pickNeutralAt,
   sessionStore,
   setComparePosition,
   setGeometry,
   setOriginal,
   setView,
-  useCanvasGeometry,
-  useCanvasSource,
   useSession,
 } from '../state/session';
 import { HistogramOverlay, histogramOf, type Histogram } from './histogram';
 import { publishOutput } from './output';
 import { useI18n } from '../i18n';
+import { useSettings } from '../state/settings';
+import { resolveDisplaySpace } from './colorSpace';
+import { inTauri } from '../host/transport';
+import { onFrameDrop } from '../windows/frameDrag';
+import { clampZoom } from './zoom';
 
 const SURROUND = 0x5f / 255;
 
@@ -92,56 +112,110 @@ export function Canvas() {
   const gl = useRef<GLRenderer | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0, dpr: 1 });
   const [glError, setGlError] = useState<string | null>(null);
-  const [displayGeneration, setDisplayGeneration] = useState(0);
+  const [glVersion, setGlVersion] = useState(0);
   const [histogram, setHistogram] = useState<Histogram | null>(null);
+  const [straightenLine, setStraightenLine] = useState<{ from: Point; to: Point } | null>(null);
+  const [pairMenu, setPairMenu] = useState<{ x: number; y: number; side: PairSide } | null>(null);
   const uploaded = useRef({ print: null as unknown, original: null as unknown });
 
   const imageVersion = useSession((s) => s.imageVersion);
-  // The canvas's geometry: the user's crop, or none while the engine has cut
-  // the frame (a film edge). The crop tool always sees the user's, since the
-  // engine does not cut while it is open (`engineCut`).
-  const geometry = useCanvasGeometry();
+  const geometry = useSession((s) => s.sidecar.geometry);
+  const params = useSession((s) => s.sidecar.params);
+  const noFilm = useSession((s) => s.sidecar.noFilm);
+  const gate = useSession((s) => s.gate);
   const adjustments = useSession((s) => s.sidecar.adjustments);
-  const nativeSize = useCanvasSource();
+  const nativeSize = useSession((s) => s.nativeSize);
   const view = useSession((s) => s.view);
   const tool = useSession((s) => s.tool);
   const comparing = useSession((s) => s.comparing);
   const comparePosition = useSession((s) => s.comparePosition);
   const showingOriginal = useSession((s) => s.showingOriginal);
   const badge = useSession((s) => s.badge);
+  const developing = useSession((s) => s.developing);
+  const lastError = useSession((s) => s.lastError);
   const selection = useSession((s) => s.selection);
   const batch = useSession((s) => s.batchExporting);
   const exportOpen = useSession((s) => s.exportOpen);
-  const cropping = tool === 'crop';
+  const displaySpace = useSession((s) => s.displaySpace);
+  const maxTextureSize = useSession((s) => s.maxTextureSize);
+  const previewGamut = useSettings((s) => s.previewGamut);
+  const originalFallback = !frameImages.print && !!frameImages.original;
+  const cropping = tool === 'crop' && !originalFallback;
+  const pair = useSession((s) => s.pair), pairLayer = useSession((s) => s.pairLayer), pairPlacing = useSession((s) => s.pairPlacing), pairInfo = useSession((s) => s.pairInfo);
+  const pairGates = showingOriginal && pair ? pairRects(pair) : pairCanvasRects();
+  const framing = cropping && geometryInNegative(params, gate, noFilm);
+  const filmCanvas = !originalFallback && !cropping && !showingOriginal && !!sourceGeometryFor(params, geometry, gate, noFilm);
+  const canvasGeometry = originalFallback ? GEOMETRY_DEFAULT : filmCanvas ? canvasGeometryFor(params, geometry, gate, noFilm) : geometry;
 
   useEffect(() => {
-    const surface = canvas.current;
-    if (!surface) return;
+    const c = canvas.current;
+    if (!c) return;
     const initialize = () => {
       try {
-        gl.current = new GLRenderer(surface);
+        gl.current = new GLRenderer(c);
         uploaded.current = { print: null, original: null };
+        noteTextureLimit(gl.current.maxTexture);
         setGlError(null);
-        setDisplayGeneration((generation) => generation + 1);
-      } catch (e) {
-        setGlError((e as Error).message);
-      }
+        setGlVersion((n) => n + 1);
+      } catch (e) { setGlError((e as Error).message); }
     };
-    const lost = (event: Event) => {
-      // Opt into restoration. A driver reset otherwise leaves stale textures
-      // and a silent black canvas for the rest of the application session.
-      event.preventDefault();
+    const lost = (e: Event) => {
+      e.preventDefault();
       gl.current = null;
-      setGlError(tz('Display connection lost; waiting for recovery.', '显示连接中断，正在等待恢复。'));
+      uploaded.current = { print: null, original: null };
+      setGlError('Display connection lost; waiting for recovery. 显示连接已断开，正在等待恢复。');
+      setGlVersion((n) => n + 1);
     };
-    surface.addEventListener('webglcontextlost', lost);
-    surface.addEventListener('webglcontextrestored', initialize);
+    c.addEventListener('webglcontextlost', lost);
+    c.addEventListener('webglcontextrestored', initialize);
     initialize();
     return () => {
-      surface.removeEventListener('webglcontextlost', lost);
-      surface.removeEventListener('webglcontextrestored', initialize);
+      c.removeEventListener('webglcontextlost', lost);
+      c.removeEventListener('webglcontextrestored', initialize);
+      gl.current?.dispose();
+      gl.current = null;
     };
-  }, [tz]);
+  }, []);
+
+  // The browser owns the final monitor ICC conversion. Re-evaluate when the
+  // window moves between displays; a requested P3 mode is used only when the
+  // actual WebGL drawing buffer accepts it. Auto also requires a wide display.
+  useEffect(() => {
+    const renderer = gl.current;
+    if (!renderer) return;
+    const gamut = window.matchMedia('(color-gamut: p3)');
+    const p3 = renderer.supportsP3();
+    const refresh = () => {
+      noteDisplaySpace(renderer.setDisplaySpace(resolveDisplaySpace(previewGamut, p3, gamut.matches)));
+      const rect = wrap.current?.getBoundingClientRect();
+      if (rect) setSize((old) => {
+        const dpr = window.devicePixelRatio || 1;
+        return old.width === rect.width && old.height === rect.height && old.dpr === dpr ? old
+          : { width: rect.width, height: rect.height, dpr };
+      });
+    };
+    refresh();
+    gamut.addEventListener('change', refresh);
+    window.addEventListener('focus', refresh);
+    window.addEventListener('resize', refresh);
+    let active = true;
+    const unlisten: (() => void)[] = [];
+    if (inTauri()) void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
+      const win = getCurrentWindow();
+      for (const subscribe of [() => win.onMoved(refresh), () => win.onScaleChanged(refresh)]) {
+        const off = await subscribe();
+        if (active) unlisten.push(off);
+        else off();
+      }
+    }).catch(() => { /* Media, focus and resize remain available on older hosts. */ });
+    return () => {
+      active = false;
+      gamut.removeEventListener('change', refresh);
+      window.removeEventListener('focus', refresh);
+      window.removeEventListener('resize', refresh);
+      for (const off of unlisten) off();
+    };
+  }, [previewGamut, glVersion]);
 
   useEffect(() => {
     const el = wrap.current;
@@ -154,13 +228,14 @@ export function Canvas() {
     return () => ro.disconnect();
   }, []);
 
-  const native = nativeSize ?? (frameImages.print ? { width: frameImages.print.width, height: frameImages.print.height } : null);
+  const native = originalFallback ? (frameImages.original!.nativeSize ?? { width: frameImages.original!.width, height: frameImages.original!.height })
+    : (filmCanvas ? frameImages.print?.nativeSize : nativeSize) ?? (frameImages.print ? { width: frameImages.print.width, height: frameImages.print.height } : null);
   const layout =
     native && size.width > 0
       ? computeLayout(
           { width: Math.round(size.width * size.dpr), height: Math.round(size.height * size.dpr) },
           native,
-          geometry,
+          canvasGeometry,
           cropping,
           view,
           cropping ? 24 * size.dpr : 0,
@@ -179,20 +254,16 @@ export function Canvas() {
   // a histogram computed from no image then never came back.
   const ensureUploaded = (r: GLRenderer) => {
     try {
-      if (uploaded.current.print !== frameImages.print) {
-        r.setImage(frameImages.print);
-        uploaded.current.print = frameImages.print;
-      }
-      if (uploaded.current.original !== frameImages.original) {
-        r.setOriginal(frameImages.original);
-        uploaded.current.original = frameImages.original;
-      }
-      setGlError(null);
-      return true;
-    } catch (error) {
-      setGlError((error as Error).message);
-      return false;
+    if (uploaded.current.print !== frameImages.print) {
+      r.setImage(frameImages.print);
+      uploaded.current.print = frameImages.print;
     }
+    if (uploaded.current.original !== frameImages.original) {
+      r.setOriginal(frameImages.original);
+      uploaded.current.original = frameImages.original;
+    }
+      return true;
+    } catch (e) { setGlError((e as Error).message); return false; }
   };
 
   // Draw.
@@ -222,23 +293,25 @@ export function Canvas() {
       editingCrop: cropping ? geometry : null,
       sourceSize: layout.native,
       adjustments,
-      compare: showingOriginal ? 2 : comparing ? 1 : 0,
+      compare: originalFallback || framing || showingOriginal ? 2 : comparing ? 1 : 0,
       split: comparePosition,
       surround: SURROUND,
     };
     r.draw(state);
-  }, [imageVersion, displayGeneration, layout?.zoom, layout?.offset.x, layout?.offset.y, size, geometry, adjustments, cropping, comparing, comparePosition, showingOriginal, layout]);
+    notePreviewDrawn();
+  }, [imageVersion, displaySpace, layout?.zoom, layout?.offset.x, layout?.offset.y, size, geometry, adjustments, cropping, framing, comparing, comparePosition, showingOriginal, originalFallback, layout]);
 
   // The output, small: navigator and histogram (the canvas's frame, trap 33).
   useEffect(() => {
     const r = gl.current;
-    if (!r || !native || !frameImages.print) {
+    if (!r || !native || (!frameImages.print && !originalFallback)) {
       publishOutput(null);
       setHistogram(null);
       return;
     }
     const t = setTimeout(() => {
-      const out = outputSize(geometry, native);
+      const outputGeometry = framing ? geometry : canvasGeometry;
+      const out = outputSize(outputGeometry, native);
       // Small for the navigator and the histogram; larger while the export
       // page shows it as the proof.
       const k = (sessionStore.getState().exportOpen ? 1400 : 256) / Math.max(out.width, out.height);
@@ -248,20 +321,17 @@ export function Canvas() {
         viewport: { width: w, height: h },
         offset: { x: 0, y: 0 },
         outSize: { width: w, height: h },
-        display: geometry,
+        display: outputGeometry,
         editingCrop: null,
         sourceSize: native,
         adjustments,
-        compare: 0,
+        compare: originalFallback || framing ? 2 : 0,
         split: 0.5,
         surround: SURROUND,
       };
-      if (!ensureUploaded(r)) {
-        publishOutput(null);
-        return;
-      }
+      if (!ensureUploaded(r)) return;
       const px = r.renderOutput(state, w, h);
-      publishOutput(px ? { width: w, height: h, data: px } : null);
+      publishOutput(px ? { width: w, height: h, data: px, colorSpace: r.displaySpace } : null);
       if (px) void histogramOf(px).then(setHistogram);
       else setHistogram(null);
       // `renderOutput` leaves the default framebuffer bound but the canvas
@@ -275,22 +345,25 @@ export function Canvas() {
           editingCrop: cropping ? geometry : null,
           sourceSize: layout.native,
           adjustments,
-          compare: showingOriginal ? 2 : comparing ? 1 : 0,
+          compare: originalFallback || framing || showingOriginal ? 2 : comparing ? 1 : 0,
           split: comparePosition,
           surround: SURROUND,
         });
     }, 60);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [imageVersion, displayGeneration, geometry, adjustments, native?.width, native?.height, exportOpen]);
+  }, [glVersion, imageVersion, displaySpace, geometry, adjustments, native?.width, native?.height, exportOpen, framing, filmCanvas]);
 
   // ---- pointer
   const drag = useRef<
     | null
     | { kind: 'pan'; x: number; y: number; cx: number; cy: number }
     | { kind: 'crop'; handle: CropHandle; start: Point; g: Geometry }
+    | { kind: 'straighten'; start: Point; g: Geometry }
+    | { kind: 'pair'; start: Point; side: PairSide; placement: PairPlacement; source: { width: number; height: number }; rect: PairRect }
     | { kind: 'split' }
   >(null);
+  useEffect(() => { drag.current = null; setStraightenLine(null); setPairMenu(null); }, [tool, selection]);
 
   const toSource = useCallback(
     (clientX: number, clientY: number): Point | null => {
@@ -304,12 +377,46 @@ export function Canvas() {
     [layout, size.dpr],
   );
 
+  useEffect(() => wrap.current ? onFrameDrop(wrap.current, ({ path, clientX, clientY }) => {
+    if (!pair || !pairGates || !path || batch) return false;
+    const point = toSource(clientX, clientY);
+    const side = point && PAIR_SIDES.find((s) => { const r = pairGates[s]; return point.x >= r.x && point.y >= r.y && point.x <= r.x + r.width && point.y <= r.y + r.height; });
+    if (!side) return false;
+    void setPairHole(side, path);
+    return true;
+  }) : undefined, [pair, pairGates, batch, toSource]);
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (!layout || batch) return;
+    setPairMenu(null);
+    if (tool === 'neutral' && e.button === 0) {
+      const p = toSource(e.clientX, e.clientY);
+      if (p && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1) void pickNeutralAt(p.x, p.y);
+      return;
+    }
     (e.target as Element).setPointerCapture?.(e.pointerId);
+    if (pair && pairGates && e.button === 0 && tool === 'select') {
+      const point = toSource(e.clientX, e.clientY);
+      const hit = point && PAIR_SIDES.find((side) => { const r = pairGates[side]; return point.x >= r.x && point.y >= r.y && point.x <= r.x + r.width && point.y <= r.y + r.height; });
+      if (!hit) setPairLayer('film');
+      else {
+        const hole = pair[hit], info = pairInfo?.[hit];
+        if (pairPlacing && pairLayer === hit && hole && info?.available) {
+          beginGesture(); drag.current = { kind: 'pair', start: point!, side: hit, placement: hole.placement, source: outputSize(hole.geometry, info), rect: pairGates[hit] }; return;
+        }
+        setPairLayer(hit);
+        if (!hole) { void choosePairHole(hit); return; }
+      }
+    }
     if (cropping && e.button === 0) {
       const s = toSource(e.clientX, e.clientY);
       if (!s) return;
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        drag.current = { kind: 'straighten', start: s, g: geometry };
+        setStraightenLine({ from: s, to: s });
+        return;
+      }
       const tol = (12 * size.dpr) / layout.zoom;
       const h = handleAt(geometry, s, layout.native, tol);
       if (h) {
@@ -331,10 +438,17 @@ export function Canvas() {
   const onPointerMove = (e: React.PointerEvent) => {
     const d = drag.current;
     if (!d || !layout) return;
-    if (d.kind === 'pan') {
+    if (d.kind === 'pair') {
+      const point = toSource(e.clientX, e.clientY);
+      if (point && pair) setPairPlacement(d.side, () => draggedPlacement(d.placement,
+        { x: (point.x - d.start.x) / d.rect.width, y: (point.y - d.start.y) / d.rect.height }, d.source, pairAspect(pair)), true, true);
+    } else if (d.kind === 'pan') {
       const dx = ((e.clientX - d.x) * size.dpr) / layout.outSize.width;
       const dy = ((e.clientY - d.y) * size.dpr) / layout.outSize.height;
       setView({ cx: clamp(d.cx - dx, 0, 1), cy: clamp(d.cy - dy, 0, 1) });
+    } else if (d.kind === 'straighten') {
+      const to = toSource(e.clientX, e.clientY);
+      if (to) setStraightenLine({ from: d.start, to });
     } else if (d.kind === 'crop') {
       const s = toSource(e.clientX, e.clientY);
       if (!s) return;
@@ -350,25 +464,45 @@ export function Canvas() {
     }
   };
 
-  const onPointerUp = () => {
+  const onPointerUp = (e: React.PointerEvent) => {
+    const d = drag.current;
+    if (d?.kind === 'pair') commitPairPlacement();
+    if (d?.kind === 'straighten' && layout) {
+      const to = toSource(e.clientX, e.clientY);
+      // This crop view displays the unrotated source with a rotated crop
+      // overlay. Source-space endpoints solve an absolute angle; adding the
+      // old angle (as in Mac's rotating edit-space view) would double it.
+      const angle = to ? straightenAngle(d.start, to, layout.native) : null;
+      if (angle !== null) {
+        beginGesture();
+        setGeometry(() => straightened(d.g, angle, layout.native), { coalesce: true });
+      }
+    }
     drag.current = null;
+    setStraightenLine(null);
   };
 
   const onWheel = (e: React.WheelEvent) => {
     if (!layout || cropping || !wrap.current) return;
+    if (pair && pairPlacing && pairLayer !== 'film' && pairGates) {
+      const hole = pair[pairLayer], info = pairInfo?.[pairLayer], point = toSource(e.clientX, e.clientY), r = pairGates[pairLayer];
+      if (hole && info?.available) setPairPlacement(pairLayer, (p) => zoomedPlacement(p, Math.exp(-e.deltaY * (e.ctrlKey ? .01 : .0015)),
+        point && point.x >= r.x && point.x <= r.x + r.width && point.y >= r.y && point.y <= r.y + r.height
+          ? { x: (point.x - r.x) / r.width, y: (point.y - r.y) / r.height } : { x: .5, y: .5 }, outputSize(hole.geometry, info), pairAspect(pair)));
+      return;
+    }
     const rect = wrap.current.getBoundingClientRect();
     const px = (e.clientX - rect.left) * size.dpr;
     const py = (e.clientY - rect.top) * size.dpr;
     const ou = { x: (px - layout.offset.x) / layout.outSize.width, y: (py - layout.offset.y) / layout.outSize.height };
     const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0015));
-    const zoom = clamp(layout.zoom * factor, Math.min(layout.fitZoom, 0.05), 16);
+    const zoom = clampZoom(layout.zoom * factor, layout.fitZoom);
     const outW = layout.out.width * zoom;
     const outH = layout.out.height * zoom;
     // Keep the output point under the pointer where it is.
     const cx = clamp(ou.x - (px - layout.viewport.width / 2) / outW, 0, 1);
     const cy = clamp(ou.y - (py - layout.viewport.height / 2) / outH, 0, 1);
-    if (zoom <= layout.fitZoom * 1.0001 && factor < 1) setView({ fit: true, cx: 0.5, cy: 0.5 });
-    else setView({ fit: false, zoom, cx, cy });
+    setView({ fit: false, zoom, cx, cy });
   };
 
   // Space held: the original (one draw).
@@ -390,8 +524,10 @@ export function Canvas() {
     };
   }, []);
 
-  const cursor = cropping ? 'crosshair' : tool === 'hand' ? 'grab' : 'default';
+  const cursor = cropping || tool === 'neutral' ? 'crosshair' : tool === 'hand' || pairPlacing ? 'grab' : 'default';
   const css = (v: number) => v / size.dpr;
+  const textureLimited = maxTextureSize !== null && layout && !view.fit && !cropping && view.zoom >= 1
+    && Math.max(layout.out.width, layout.out.height) > maxTextureSize;
 
   return (
     <div
@@ -401,14 +537,50 @@ export function Canvas() {
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
+      onPointerCancel={() => { drag.current = null; setStraightenLine(null); }}
       onWheel={onWheel}
+      onContextMenu={(e) => {
+        if (!pair || !pairGates || batch) return;
+        const point = toSource(e.clientX, e.clientY), r = wrap.current?.getBoundingClientRect();
+        const side = point && PAIR_SIDES.find((s) => { const g = pairGates[s]; return point.x >= g.x && point.y >= g.y && point.x <= g.x + g.width && point.y <= g.y + g.height; });
+        if (!side || !r) return;
+        e.preventDefault(); setPairLayer(side); setPairMenu({ side, x: e.clientX - r.left, y: e.clientY - r.top });
+      }}
       data-testid="canvas"
     >
       <canvas ref={canvas} className="canvas-gl" />
+      {pair && pairGates && layout && <svg className="crop-overlay" width="100%" height="100%" data-testid="pair-overlay">
+        {PAIR_SIDES.map((side) => {
+          const r = pairGates[side], x = css(layout.offset.x + r.x * layout.outSize.width), y = css(layout.offset.y + r.y * layout.outSize.height);
+          const width = css(r.width * layout.outSize.width), height = css(r.height * layout.outSize.height);
+          return <g key={side}><rect x={x} y={y} width={width} height={height} fill="none" stroke={side === pairLayer ? 'var(--accent)' : 'transparent'} strokeWidth={pairPlacing ? 2 : 1} />
+            {!pair[side] && <text x={x + width / 2} y={y + height / 2} fill="var(--text)" fontSize={36} textAnchor="middle">+</text>}</g>;
+        })}
+      </svg>}
+      {pairMenu && pair && <div role="menu" className="menu pair-context" style={{ left: pairMenu.x, top: pairMenu.y }} onPointerDown={(e) => e.stopPropagation()}>
+        <button role="menuitem" onClick={() => { void choosePairHole(pairMenu.side); setPairMenu(null); }}>{tz('Replace frame…', '替换照片…')}</button>
+        {pair[pairMenu.side] && <>
+          <button role="menuitem" onClick={() => { togglePairPlacing(); setPairMenu(null); }}>{tz('Crop this frame', '裁剪这一格')}</button>
+          <button role="menuitem" onClick={() => { setPairPlacement(pairMenu.side, () => ({ ...PLACEMENT_DEFAULT }), false); setPairMenu(null); }}>{tz('Reset crop', '重置裁剪')}</button>
+          <button role="menuitem" onClick={() => { click(pair[pairMenu.side]!.path); setPairMenu(null); }}>{tz('Open frame alone', '单独打开照片')}</button>
+          <button role="menuitem" onClick={() => { void setPairHole(pairMenu.side, null); setPairMenu(null); }}>{tz('Remove frame', '移除照片')}</button>
+        </>}
+      </div>}
       {glError && <div className="canvas-message">{tz('This display cannot draw the picture (WebGL2): ', '此显示无法绘制画面（WebGL2）：') + glError}</div>}
-      {!selection && !glError && <div className="canvas-message">{tz('Open a folder or drop photographs here (Ctrl+O).', '打开文件夹或把照片拖到这里（Ctrl+O）。')}</div>}
-      {layout && cropping && <CropOverlay layout={layout} geometry={geometry} dpr={size.dpr} />}
+      {selection && lastError && !frameImages.print && !frameImages.original && !glError && <div className="canvas-message" role="alert">{lastError}</div>}
+      {!selection && !glError && <div className="canvas-message canvas-empty" data-testid="canvas-empty">
+        <div className="canvas-empty-actions" onPointerDown={(e) => e.stopPropagation()}
+          onKeyDown={(e) => { if (e.code === 'Space') e.stopPropagation(); }}>
+          <button className="btn primary" disabled={batch} onClick={() => void openDialog()} title="Ctrl+O">
+            {tz('Import photographs…', '选择照片导入…')}
+          </button>
+          <button className="btn" disabled={batch} onClick={() => void openFolderDialog()} title="Ctrl+Shift+O">
+            {tz('Open entire folder…', '打开整个文件夹…')}
+          </button>
+        </div>
+        <span>{tz('You can also drag photographs or a folder here.', '也可以将图片或文件夹拖到这里。')}</span>
+      </div>}
+      {layout && cropping && <CropOverlay layout={layout} geometry={geometry} dpr={size.dpr} line={straightenLine} />}
       {layout && comparing && !cropping && (
         <div
           className="compare-line"
@@ -426,8 +598,17 @@ export function Canvas() {
       )}
       <div className="canvas-corner">
         {histogram && <HistogramOverlay h={histogram} />}
-        {badge && selection && (
-          <span className={'tier-badge ' + badge} data-testid="tier-badge" title={badge === 'full' ? tz('The frame at its own resolution', '照片自身分辨率') : tz('Preview resolution — the frame’s own is on its way', '预览分辨率——全尺寸正在渲染')}>
+        {textureLimited && <span className="caption" data-testid="preview-limit" style={{ maxWidth: 280 }}>
+          {tz(`Display detail is limited to ${maxTextureSize} pixels. Export keeps the chosen resolution.`,
+            `当前显示最多 ${maxTextureSize} 像素；导出仍使用所选分辨率。`)}
+        </span>}
+        {originalFallback && selection && <span className="tier-badge preview" data-testid="camera-preview-badge">
+          {developing ? tz('Camera preview · loading film effect', '原图预览 · 正在加载胶片效果')
+            : lastError ? tz('Camera preview · film effect failed to load', '原图预览 · 胶片效果加载失败')
+              : tz('Camera preview', '原图预览')}
+        </span>}
+        {!originalFallback && badge && selection && (
+          <span className={'tier-badge ' + badge} data-testid="tier-badge" title={badge === 'full' ? tz('Rendered from the full-resolution source; display detail follows zoom', '已完成原尺寸渲染；显示精细度随缩放调整') : tz('Preview resolution — the frame’s own is on its way', '预览分辨率——全尺寸正在渲染')}>
             {badge === 'full' ? 'full' : 'preview'}
           </span>
         )}
@@ -448,7 +629,7 @@ export function isTyping(t: EventTarget | null): boolean {
   return false;
 }
 
-function CropOverlay({ layout, geometry, dpr }: { layout: Layout; geometry: Geometry; dpr: number }) {
+function CropOverlay({ layout, geometry, dpr, line }: { layout: Layout; geometry: Geometry; dpr: number; line: { from: Point; to: Point } | null }) {
   const toView = (s: Point) => {
     const o = outputPoint(layout.display, s, layout.native);
     return { x: (layout.offset.x + o.x * layout.outSize.width) / dpr, y: (layout.offset.y + o.y * layout.outSize.height) / dpr };
@@ -461,6 +642,7 @@ function CropOverlay({ layout, geometry, dpr }: { layout: Layout; geometry: Geom
     lines.push([at(t, 0), at(t, 1)], [at(0, t), at(1, t)]);
   }
   void centre;
+  const guide = line ? [toView(line.from), toView(line.to)] as const : null;
   return (
     <svg className="crop-overlay" width="100%" height="100%">
       <polygon points={corners.map((p) => `${p.x},${p.y}`).join(' ')} fill="none" stroke="var(--selection-frame)" strokeWidth={1} />
@@ -475,6 +657,10 @@ function CropOverlay({ layout, geometry, dpr }: { layout: Layout; geometry: Geom
         const hh = isCorner(h) ? 11 : horiz ? 4 : 22;
         return <rect key={h} x={p.x - w / 2} y={p.y - hh / 2} width={w} height={hh} fill="var(--selection-frame)" />;
       })}
+      {guide && <g data-testid="straighten-line" stroke="var(--accent)" strokeWidth={1.5}>
+        <line x1={guide[0].x} y1={guide[0].y} x2={guide[1].x} y2={guide[1].y} />
+        {guide.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r={3} fill="var(--card)" />)}
+      </g>}
     </svg>
   );
 }

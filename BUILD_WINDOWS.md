@@ -1,5 +1,9 @@
 # Build the Windows 1.3.4 release
 
+For 1.3.4-win.4 (official Windows beta integration), use
+[BUILD_WINDOWS_R4.md](BUILD_WINDOWS_R4.md). The older instructions below are
+retained for the earlier maintenance packages.
+
 This is the Windows maintenance release by **shayt0ny**, derived from
 [JamesQiu2005/SpektraLab](https://github.com/JamesQiu2005/SpektraLab) through
 [NANATATA's Windows port](https://github.com/YZH2006517/SpektraLab-Windows-NANATATA).

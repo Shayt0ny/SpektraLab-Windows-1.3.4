@@ -11,6 +11,19 @@
 #   SPEKTRALAB_LIBRAW_SOURCE    LibRaw 0.22.2 source tree (RAW decode)
 # The Vulkan loader is never linked: engine/third_party/volk opens it at run
 # time. glslangValidator compiles the kernels to SPIR-V at build time.
+# macOS normally builds the engine with build.sh/Xcode (Metal). For parity
+# work only, SPEKTRALAB_VULKAN_ON_APPLE=ON builds the Vulkan backend on macOS
+# through MoltenVK: every source then takes the portable (non-Apple) path,
+# selected by SPK_VULKAN_BACKEND, so the Mac can grade Vulkan against Metal on
+# identical input. Off Apple nothing changes.
+option(SPEKTRALAB_VULKAN_ON_APPLE "Build the Vulkan backend on macOS (MoltenVK), for parity tests" OFF)
+if(NOT APPLE OR SPEKTRALAB_VULKAN_ON_APPLE)
+    set(SPEKTRALAB_PORTABLE_BACKEND ON)
+    add_compile_definitions(SPK_VULKAN_BACKEND=1)
+else()
+    set(SPEKTRALAB_PORTABLE_BACKEND OFF)
+endif()
+
 add_library(spektralab_core STATIC
     src/core/blob.cpp
     src/core/cam16.cpp
@@ -45,13 +58,15 @@ add_library(spektralab_pipeline OBJECT
     src/pipeline/engine.cpp
     src/pipeline/pipeline.cpp
     src/pipeline/scene_latitude.cpp
-    src/pipeline/contrast_mask.cpp
-    src/pipeline/overscan.cpp
 )
 set_target_properties(spektralab_pipeline PROPERTIES POSITION_INDEPENDENT_CODE ON)
-if(NOT APPLE)
-    # CoreGraphics, CoreText and vImage's stand-in for the film edge.
-    target_sources(spektralab_pipeline PRIVATE src/pipeline/edge_raster.cpp)
+if(NOT SPEKTRALAB_PORTABLE_BACKEND)
+    target_sources(spektralab_pipeline PRIVATE
+        src/pipeline/contrast_mask.cpp src/pipeline/overscan.cpp)
+else()
+    target_sources(spektralab_pipeline PRIVATE src/pipeline/windows_unported.cpp src/pipeline/view_process.cpp
+        src/pipeline/overscan.cpp src/pipeline/imprint_raster.cpp)
+    include(cmake/ImprintFonts.cmake)
 endif()
 target_link_libraries(spektralab_pipeline PRIVATE spektralab_core)
 target_include_directories(spektralab_pipeline PRIVATE
@@ -60,6 +75,15 @@ target_include_directories(spektralab_pipeline PRIVATE
 )
 
 if(BUILD_TESTING)
+    if(WIN32)
+        # Exercise resource opens without a Vulkan device (also under Wine).
+        add_executable(spk_resource_paths tests/resource_paths.cpp)
+        target_link_libraries(spk_resource_paths PRIVATE spektralab_core)
+        add_test(NAME spk_resource_paths COMMAND spk_resource_paths
+            "${CMAKE_CURRENT_SOURCE_DIR}/resources"
+            "${CMAKE_CURRENT_BINARY_DIR}/resource-path-tests")
+    endif()
+
     add_executable(spk_dump_json tests/dump_json.cpp)
     target_link_libraries(spk_dump_json PRIVATE spektralab_core)
     add_test(NAME spk_core_schema
@@ -74,7 +98,7 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_BINARY_DIR}/setup.idx")
 endif()
 
-if(NOT APPLE)
+if(SPEKTRALAB_PORTABLE_BACKEND)
     option(SPEKTRALAB_BUILD_NATIVE_RAW "Build LibRaw decode, the image writer and the RAW tools" OFF)
     option(SPEKTRALAB_BUILD_HOST "Build engine/host: spektralab-host (needs SPEKTRALAB_BUILD_NATIVE_RAW)" OFF)
     option(SPEKTRALAB_BUILD_DESKTOP "Build the minimal native Windows RAW viewer (Windows only)" ON)
@@ -84,6 +108,12 @@ if(NOT APPLE)
 
     # Headers: the pinned Khronos tree when setup-deps.sh fetched it, else an
     # installed SDK or the system's. Only headers -- volk loads the loader.
+    # build-windows.ps1 and windows_UI/build.ps1 pass the older
+    # SPEKTRALAB_VULKAN_INCLUDE_DIR spelling; accept it as an alias.
+    if(SPEKTRALAB_VULKAN_INCLUDE_DIR AND NOT SPEKTRALAB_VULKAN_HEADERS)
+        set(SPEKTRALAB_VULKAN_HEADERS "${SPEKTRALAB_VULKAN_INCLUDE_DIR}" CACHE PATH
+            "Vulkan headers directory" FORCE)
+    endif()
     find_path(SPEKTRALAB_VULKAN_HEADERS vulkan/vulkan_core.h
         HINTS "${SPEKTRALAB_DEPS_DIR}/Vulkan-Headers/include" "$ENV{VULKAN_SDK}/Include"
               "$ENV{VULKAN_SDK}/include"
@@ -104,20 +134,19 @@ if(NOT APPLE)
         set(vulkan_resource_dir "${CMAKE_CURRENT_BINARY_DIR}/resources")
         set(vulkan_shader_dir "${vulkan_resource_dir}/vulkan")
         set(SPEKTRALAB_VULKAN_KERNELS
-            spk_math_probe spk_take_rgb spk_matmul3 spk_stride_sample
+            spk_math_probe spk_split_probe spk_take_rgb spk_matmul3 spk_stride_sample
             spk_affine3 spk_tc_b spk_lut2d_cubic spk_sep_fir_acc spk_iir_df_acc
             spk_lincomb3 spk_log10_guarded spk_curves
             spk_couplers_correction spk_spectral_epilogue
             spk_print_exposure spk_cam16ucs_compress
             spk_cctf_encode_matrix spk_to_rgba16
+            spk_view_grade spk_view_grade_float spk_view_grade_di spk_view_geometry spk_view_pack spk_view_cam16 spk_view_pair
             spk_grain_layers spk_grain_layer_one spk_grain_simple
             spk_lognormal_field spk_rng_probe spk_mul spk_glare_add
-            spk_reduce_max spk_boost spk_bw_correct spk_edr spk_cctf_decode
+            spk_reduce_max spk_boost spk_highlight_headroom spk_bw_correct spk_edr spk_cctf_decode
             spk_zoom_bilinear_mirror spk_geometry_resample_df
-            spk_lut3d_trilinear spk_di_normalise spk_di_encode
-            spk_scene_latitude spk_mask_reduce spk_mask_epilogue
-            spk_overscan_canvas spk_overscan_add_mask spk_overscan_film_present
-            spk_overscan_light spk_highlight_headroom
+            spk_lut3d_trilinear spk_di_normalise spk_di_encode spk_scene_latitude
+            spk_overscan_canvas spk_overscan_add_mask spk_overscan_film_present spk_overscan_light
             CACHE INTERNAL "")
         set(vulkan_spirv)
         file(GLOB vulkan_includes "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/vulkan/*.glsl")
@@ -134,18 +163,27 @@ if(NOT APPLE)
             list(APPEND vulkan_spirv "${spirv}")
         endforeach()
         set(SPEKTRALAB_VULKAN_SPIRV ${vulkan_spirv} CACHE INTERNAL "")
-        # The product's own profiles (CineStill 800T, the black-and-white films
-        # and Ilford's paper; resources_product/NOTICE.md) go in beside
-        # spektrafilm's, as build.sh's bundle lays them for the Mac: the engine
-        # opens a stock from one `profiles/` directory.
         add_custom_target(spektralab_vulkan_resources
             COMMAND "${CMAKE_COMMAND}" -E copy_directory
                     "${CMAKE_CURRENT_SOURCE_DIR}/resources" "${vulkan_resource_dir}"
+            # Product profiles overlay only the staged directory. The original
+            # spektrafilm resources stay byte-identical and separately attributed.
             COMMAND "${CMAKE_COMMAND}" -E copy_directory
                     "${CMAKE_CURRENT_SOURCE_DIR}/resources_product/profiles" "${vulkan_resource_dir}/profiles"
-            COMMAND "${CMAKE_COMMAND}" -E copy
-                    "${CMAKE_CURRENT_SOURCE_DIR}/resources_product/NOTICE.md"
-                    "${vulkan_resource_dir}/PRODUCT_PROFILES_NOTICE.md"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/resources_product/NOTICE.md" "${vulkan_resource_dir}/Product-profiles-NOTICE.md"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/resources_product/fonts/LICENSE" "${vulkan_resource_dir}/Imprint-fonts-LICENSE.txt"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/resources_product/fonts/DejaVu-LICENSE" "${vulkan_resource_dir}/Imprint-mono-font-DejaVu-LICENSE.txt"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb/LICENSE" "${vulkan_resource_dir}/stb-LICENSE.txt"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/resources_product/paper_grades.json" "${vulkan_resource_dir}/paper_grades.json"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/resources_product/neutral_print_filters.json" "${vulkan_resource_dir}/product-neutral-print-filters.json"
+            COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                    "${CMAKE_CURRENT_SOURCE_DIR}/../modern_UI/Spektrafilm/Spektrafilm/Resources/DI" "${vulkan_resource_dir}/DI"
             DEPENDS ${vulkan_spirv}
             VERBATIM)
 
@@ -189,6 +227,11 @@ if(NOT APPLE)
                 target_link_libraries(spk_desktop_host PUBLIC spk_image_io spektralab_engine)
                 add_executable(SpektraLab WIN32 tools/windows_preview.cpp)
                 target_link_libraries(SpektraLab PRIVATE spk_desktop_host comctl32 comdlg32 shell32 gdi32 user32)
+                if(MINGW)
+                    # MinGW defaults to WINVER 0x0601, which hides the DPI APIs this
+                    # host calls (GetDpiForWindow, SetProcessDpiAwarenessContext).
+                    target_compile_definitions(SpektraLab PRIVATE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
+                endif()
                 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/licenses")
                 foreach(notice LICENSE SPEKTRAFILM_LICENSE.txt)
                     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../license/${notice}" "licenses/${notice}" COPYONLY)
@@ -217,15 +260,25 @@ if(NOT APPLE)
                 add_test(NAME spk_raw_decoder_errors COMMAND spk_raw_decoder_errors
                     "${CMAKE_CURRENT_BINARY_DIR}/raw-errors")
                 add_executable(spk_raw_metadata_link tests/raw_metadata_link.cpp)
+                add_executable(spk_raw_camera tests/raw_camera.cpp)
+                target_link_libraries(spk_raw_camera PRIVATE spk_libraw)
+                add_test(NAME spk_raw_camera COMMAND spk_raw_camera)
+                add_executable(spk_raw_camera_profile tests/raw_camera_profile.cpp)
+                target_include_directories(spk_raw_camera_profile PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+                target_link_libraries(spk_raw_camera_profile PRIVATE spk_libraw)
+                add_test(NAME spk_raw_camera_profile COMMAND spk_raw_camera_profile)
+                add_executable(spk_raw_active_area tests/raw_active_area.cpp)
+                target_include_directories(spk_raw_active_area PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+                target_link_libraries(spk_raw_active_area PRIVATE spk_libraw)
+                add_test(NAME spk_raw_active_area COMMAND spk_raw_active_area)
                 target_link_libraries(spk_raw_metadata_link PRIVATE spk_libraw)
                 add_test(NAME spk_raw_metadata_link COMMAND spk_raw_metadata_link)
                 add_executable(spk_raw_headroom tests/raw_headroom.cpp)
                 target_link_libraries(spk_raw_headroom PRIVATE spk_image_io)
                 add_test(NAME spk_raw_headroom COMMAND spk_raw_headroom)
-                add_executable(spk_raw_active_area tests/raw_active_area.cpp)
-                target_include_directories(spk_raw_active_area PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-                target_link_libraries(spk_raw_active_area PRIVATE spk_libraw)
-                add_test(NAME spk_raw_active_area COMMAND spk_raw_active_area)
+                add_executable(spk_raw_threads tests/raw_threads.cpp)
+                target_link_libraries(spk_raw_threads PRIVATE spk_image_io spk_libraw)
+                add_test(NAME spk_raw_threads COMMAND spk_raw_threads)
             endif()
         endif()
 
@@ -260,7 +313,7 @@ if(NOT APPLE)
             add_test(NAME spk_vulkan_smoke
                 COMMAND spk_vulkan_smoke "${vulkan_resource_dir}")
 
-            foreach(probe grain pointwise resample transfer geometry lut_di features memory)
+            foreach(probe grain pointwise resample transfer geometry lut_di view no_film bw scene_latitude overscan pair memory)
                 add_executable(spk_vulkan_${probe} tests/gpu_vulkan_${probe}.cpp)
                 target_include_directories(spk_vulkan_${probe} PRIVATE
                     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -270,6 +323,62 @@ if(NOT APPLE)
                 add_test(NAME spk_vulkan_${probe}
                     COMMAND spk_vulkan_${probe} "${vulkan_resource_dir}")
             endforeach()
+
+            add_executable(spk_imprint_raster tests/imprint_raster.cpp)
+            target_include_directories(spk_imprint_raster PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+            target_link_libraries(spk_imprint_raster PRIVATE spektralab_engine)
+            add_test(NAME spk_imprint_raster COMMAND spk_imprint_raster)
+
+            add_test(NAME spk_vulkan_scene_latitude_api
+                COMMAND spk_vulkan_scene_latitude "${vulkan_resource_dir}" --api)
+
+            add_executable(spk_vulkan_math_gate tests/gpu_vulkan_math_gate.cpp)
+            target_include_directories(spk_vulkan_math_gate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+            target_link_libraries(spk_vulkan_math_gate PRIVATE spektralab_engine)
+            set(gate_root "${CMAKE_CURRENT_BINARY_DIR}/math-gate")
+            set(gate_fixtures)
+            foreach(kind unfused mixed broken missing)
+                set(dir "${gate_root}/${kind}")
+                set(mixed 0)
+                if(kind STREQUAL "mixed")
+                    set(mixed 1)
+                endif()
+                add_custom_command(OUTPUT "${dir}/spk_math_probe.spv"
+                    COMMAND "${CMAKE_COMMAND}" -E make_directory "${dir}"
+                    COMMAND "${SPEKTRALAB_GLSLANG}" -V --target-env vulkan1.0 -DPAIR=0 -DMIXED=${mixed}
+                        -o "${dir}/spk_math_probe.spv" "${CMAKE_CURRENT_SOURCE_DIR}/tests/math_gate_fault.comp"
+                    DEPENDS tests/math_gate_fault.comp VERBATIM)
+                list(APPEND gate_fixtures "${dir}/spk_math_probe.spv")
+                if(kind STREQUAL "broken")
+                    add_custom_command(OUTPUT "${dir}/spk_split_probe.spv"
+                        COMMAND "${SPEKTRALAB_GLSLANG}" -V --target-env vulkan1.0 -DPAIR=1 -DMIXED=0
+                            -o "${dir}/spk_split_probe.spv" "${CMAKE_CURRENT_SOURCE_DIR}/tests/math_gate_fault.comp"
+                        DEPENDS "${dir}/spk_math_probe.spv" tests/math_gate_fault.comp VERBATIM)
+                    list(APPEND gate_fixtures "${dir}/spk_split_probe.spv")
+                elseif(NOT kind STREQUAL "missing")
+                    add_custom_command(OUTPUT "${dir}/spk_split_probe.spv"
+                        COMMAND "${CMAKE_COMMAND}" -E copy "${vulkan_shader_dir}/spk_split_probe.spv" "${dir}/spk_split_probe.spv"
+                        DEPENDS "${dir}/spk_math_probe.spv" "${vulkan_shader_dir}/spk_split_probe.spv" VERBATIM)
+                    list(APPEND gate_fixtures "${dir}/spk_split_probe.spv")
+                endif()
+            endforeach()
+            add_custom_target(spk_math_gate_fixtures DEPENDS ${gate_fixtures})
+            add_dependencies(spk_vulkan_math_gate spk_math_gate_fixtures)
+            foreach(kind unfused mixed broken missing)
+                if(kind STREQUAL "broken" OR kind STREQUAL "missing")
+                    set(expect fail)
+                    set(message "split-product probe")
+                else()
+                    set(expect pass)
+                    set(message "split product")
+                endif()
+                add_test(NAME spk_math_gate_${kind} COMMAND spk_vulkan_math_gate "${gate_root}/${kind}" ${expect} "${message}")
+                set_tests_properties(spk_math_gate_${kind} PROPERTIES ENVIRONMENT "SPEKTRAFILM_VULKAN_FORCE_SPLIT=0;SPEKTRAFILM_VULKAN_STRICT_FMA=0")
+            endforeach()
+            add_test(NAME spk_math_gate_strict COMMAND spk_vulkan_math_gate "${gate_root}/unfused" fail "STRICT_FMA=1")
+            set_tests_properties(spk_math_gate_strict PROPERTIES ENVIRONMENT "SPEKTRAFILM_VULKAN_FORCE_SPLIT=1;SPEKTRAFILM_VULKAN_STRICT_FMA=1")
+            add_test(NAME spk_math_gate_forced COMMAND spk_vulkan_math_gate "${vulkan_shader_dir}" pass "forced split")
+            set_tests_properties(spk_math_gate_forced PROPERTIES ENVIRONMENT "SPEKTRAFILM_VULKAN_FORCE_SPLIT=1;SPEKTRAFILM_VULKAN_STRICT_FMA=0")
 
             if(SPEKTRALAB_BUILD_TEST_DLL)
                 add_executable(spk_windows_feature_boundaries tests/windows_feature_boundaries.cpp)

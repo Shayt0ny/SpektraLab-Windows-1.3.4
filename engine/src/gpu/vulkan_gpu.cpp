@@ -1,23 +1,23 @@
 // vulkan_gpu.cpp -- synchronous Vulkan compute with explicit host transfers.
 //
 // Compute planes remain device-local; independent reusable host buffers stage
-// uploads and readbacks. Every submission completes before returning, so no
+// uploads and readbacks in bounded chunks. Every submission completes before returning, so no
 // pooled or staging buffer can be reused while the device still reads it.
 // Command batching and native texture export are subsequent steps.
 //
-// Built everywhere but Apple (Windows and Linux). The Vulkan loader is not
+// Built everywhere but Apple (Windows and Linux), and on macOS only for parity
+// tests (SPEKTRALAB_VULKAN_ON_APPLE, MoltenVK). The Vulkan loader is not
 // linked: volk (engine/third_party/volk) opens libvulkan.so.1 / vulkan-1.dll
 // at run time, so the binary needs no SDK import library and a machine with
 // no Vulkan driver gets an error message rather than a loader failure.
-#ifndef __APPLE__
+#if !defined(__APPLE__) || defined(SPK_VULKAN_BACKEND)
 #include "gpu.hpp"
 #include "file_path.hpp"
+#include <atomic>
 
 #include "volk.h"
 
 #include <algorithm>
-#include <array>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -31,6 +31,12 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace spk::gpu {
 
@@ -39,6 +45,7 @@ struct Buffer {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
     size_t bytes = 0;
+    size_t requested_bytes = 0; // Current borrower size; bytes is pool capacity.
     VkDeviceSize allocation_bytes = 0;
     uint32_t memory_type = UINT32_MAX;
     VkMemoryPropertyFlags memory_flags = 0;
@@ -57,6 +64,10 @@ std::string vk_error(const char* operation, VkResult result) {
 struct KernelSpec { const char* name; uint32_t bindings; uint32_t workgroup; };
 constexpr KernelSpec kKernels[] = {
     {"spk_math_probe", 2, 1},
+    // The portable error-free product, in its own kernel so that neither probe
+    // has to change the other's output layout. local_size_x = 1, as
+    // spk_math_probe's is; the count is the dispatch's `n`.
+    {"spk_split_probe", 2, 1},
     {"spk_take_rgb", 3, kWorkgroup},
     {"spk_matmul3", 4, kWorkgroup},
     {"spk_stride_sample", 3, kWorkgroup},
@@ -74,6 +85,12 @@ constexpr KernelSpec kKernels[] = {
     {"spk_cam16ucs_compress", 7, kWorkgroup},
     {"spk_cctf_encode_matrix", 4, kWorkgroup},
     {"spk_to_rgba16", 3, kWorkgroup},
+    {"spk_view_grade", 5, kWorkgroup},
+    {"spk_view_grade_float", 5, kWorkgroup},
+    {"spk_view_grade_di", 6, kWorkgroup},
+    {"spk_view_geometry", 4, kWorkgroup},
+    {"spk_view_pack", 4, kWorkgroup},
+    {"spk_view_cam16", 8, kWorkgroup},
     {"spk_grain_layers", 8, kWorkgroup},
     {"spk_grain_layer_one", 8, kWorkgroup},
     {"spk_grain_simple", 5, kWorkgroup},
@@ -83,6 +100,7 @@ constexpr KernelSpec kKernels[] = {
     {"spk_glare_add", 5, kWorkgroup},
     {"spk_reduce_max", 3, kWorkgroup},
     {"spk_boost", 4, kWorkgroup},
+    {"spk_highlight_headroom", 4, kWorkgroup},
     {"spk_bw_correct", 4, kWorkgroup},
     {"spk_edr", 5, kWorkgroup},
     {"spk_cctf_decode", 3, kWorkgroup},
@@ -92,13 +110,11 @@ constexpr KernelSpec kKernels[] = {
     {"spk_di_normalise", 5, kWorkgroup},
     {"spk_di_encode", 4, kWorkgroup},
     {"spk_scene_latitude", 4, kWorkgroup},
-    {"spk_mask_reduce", 7, kWorkgroup},
-    {"spk_mask_epilogue", 8, kWorkgroup},
     {"spk_overscan_canvas", 4, kWorkgroup},
     {"spk_overscan_add_mask", 4, kWorkgroup},
     {"spk_overscan_film_present", 4, kWorkgroup},
     {"spk_overscan_light", 4, kWorkgroup},
-    {"spk_highlight_headroom", 4, kWorkgroup},
+    {"spk_view_pair", 6, kWorkgroup},
 };
 
 const KernelSpec* find_kernel(const char* name) {
@@ -139,6 +155,18 @@ public:
     }
 
     bool initialize(std::string& error) {
+        // A diagnostic override can make chunk boundaries cheap to exercise,
+        // but cannot turn staging back into an unbounded full-frame allocation.
+        if (const char* cap = std::getenv("SPEKTRAFILM_VULKAN_STAGING_BYTES"); cap && *cap) {
+            char* end = nullptr;
+            const unsigned long long value = std::strtoull(cap, &end, 10);
+            if (*cap < '0' || *cap > '9' || end == cap || *end || value < 4 ||
+                value > kMaxStagingBytes || value % 4) {
+                error = "SPEKTRAFILM_VULKAN_STAGING_BYTES must be a multiple of four between 4 and 67108864";
+                return false;
+            }
+            staging_chunk_bytes_ = size_t(value);
+        }
         // volkInitialize is idempotent; it only resolves the loader's entry.
         VkResult loader = volkInitialize();
         if (loader != VK_SUCCESS) {
@@ -146,6 +174,13 @@ public:
                     "with Vulkan support, or Mesa's lavapipe for a CPU fallback";
             return false;
         }
+#if defined(__APPLE__)
+        // MoltenVK (macOS parity builds only, SPEKTRALAB_VULKAN_ON_APPLE):
+        // it compiles MSL with fast math unless told otherwise, and fast math
+        // is what RFC-014 trap 1 forbids -- the Metal engine refuses it too.
+        // Set before the instance exists; a caller's explicit value wins.
+        setenv("MVK_CONFIG_FAST_MATH_ENABLED", "0", 0);
+#endif
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.pApplicationName = "SpektraLab headless";
@@ -156,6 +191,24 @@ public:
         VkInstanceCreateInfo create{};
         create.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         create.pApplicationInfo = &app;
+        // A portability driver (MoltenVK) is enumerated only when the instance
+        // asks for it. Requested only when the loader offers the extension,
+        // so Windows and Linux drivers see the same instance as before.
+        std::vector<const char*> instance_extensions;
+        {
+            uint32_t n_ext = 0;
+            if (vkEnumerateInstanceExtensionProperties(nullptr, &n_ext, nullptr) == VK_SUCCESS && n_ext) {
+                std::vector<VkExtensionProperties> ext(n_ext);
+                if (vkEnumerateInstanceExtensionProperties(nullptr, &n_ext, ext.data()) == VK_SUCCESS)
+                    for (const auto& e : ext)
+                        if (std::strcmp(e.extensionName, "VK_KHR_portability_enumeration") == 0) {
+                            instance_extensions.push_back("VK_KHR_portability_enumeration");
+                            create.flags |= 0x00000001;   // VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+                        }
+            }
+        }
+        create.enabledExtensionCount = uint32_t(instance_extensions.size());
+        create.ppEnabledExtensionNames = instance_extensions.empty() ? nullptr : instance_extensions.data();
         VkResult result = vkCreateInstance(&create, nullptr, &instance_);
         if (result != VK_SUCCESS) { error = vk_error("vkCreateInstance", result); return false; }
         // Instance-level loading only: every device function then goes through
@@ -253,11 +306,20 @@ public:
         device_create.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         device_create.queueCreateInfoCount = 1;
         device_create.pQueueCreateInfos = &queue_create;
-        const char* budget_extension = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
-        if (memory_budget_available_) {
-            device_create.enabledExtensionCount = 1;
-            device_create.ppEnabledExtensionNames = &budget_extension;
+        // The Vulkan spec requires a device that exposes
+        // VK_KHR_portability_subset (MoltenVK) to have it enabled.
+        std::vector<const char*> device_extensions;
+        uint32_t n_ext = 0;
+        if (vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n_ext, nullptr) == VK_SUCCESS && n_ext) {
+            std::vector<VkExtensionProperties> ext(n_ext);
+            if (vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n_ext, ext.data()) == VK_SUCCESS)
+                for (const auto& e : ext)
+                    if (std::strcmp(e.extensionName, "VK_KHR_portability_subset") == 0)
+                        device_extensions.push_back("VK_KHR_portability_subset");
         }
+        if (memory_budget_available_) device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+        device_create.enabledExtensionCount = uint32_t(device_extensions.size());
+        device_create.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
         result = vkCreateDevice(physical_, &device_create, nullptr, &device_);
         if (result != VK_SUCCESS) { error = vk_error("vkCreateDevice", result); return false; }
         vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
@@ -274,80 +336,103 @@ public:
     std::string device_name() const override { return properties_.deviceName; }
 
     bool check_math_mode(std::string& detail) override {
-        constexpr size_t n = 64;
+        if (!math_checked_) {
+            math_checked_ = true;
+            if (!probe_math_mode(math_detail_)) fused_fma_ = -1;
+        }
+        detail = math_detail_;
+        return fused_fma_ >= 0;
+    }
+
+    bool probe_math_mode(std::string& detail) {
+        // Normal, bounded inputs: binary64 represents every product exactly.
+        // Keep the original lanes and add signs, exponent ranges and exact
+        // products. This is a startup diagnostic, not proof for all inputs.
+        constexpr size_t n = 256;
         float input[2 * n];
         for (size_t i = 0; i < n; ++i) {
-            input[2 * i] = 0.1f + 0.37f * float(i);
-            input[2 * i + 1] = input[2 * i] * 0.5f + 1.0f;
+            if (i < 64) {
+                input[2 * i] = 0.1f + 0.37f * float(i);
+                input[2 * i + 1] = input[2 * i] * 0.5f + 1.0f;
+            } else {
+                input[2 * i] = std::ldexp((i & 1 ? -1.0f : 1.0f) * (1.0f + float(i) / 1024.0f), int(i % 81) - 40);
+                input[2 * i + 1] = std::ldexp((i & 2 ? -1.0f : 1.0f) * (1.0f + float(i * 13) / 4096.0f), int((i * 7) % 81) - 40);
+            }
         }
-        std::string error;
-        BufferRef src = upload(input, sizeof input, error);
-        BufferRef dst = alloc(n * sizeof(float), error);
-        if (!src || !dst ||
-            !dispatch("spk_math_probe", {Arg::buf(src), Arg::buf(dst)}, n, error)) {
-            detail = "Vulkan math probe failed: " + error;
-            return false;
-        }
-        float got[n];
-        if (!read(dst.get(), 0, got, sizeof got, error)) {
-            detail = "Vulkan math probe readback failed: " + error;
-            return false;
-        }
-        // Two acceptable outcomes, and nothing in between:
-        //   fused    -- every residual is the exact one (NVIDIA, AMD, Intel and
-        //               every GPU the Windows port was accepted on);
-        //   unfused  -- every residual is exactly 0 *and* the device is a CPU
-        //               implementation. Mesa's lavapipe lowers fma() to a
-        //               multiply and an add even under `precise` (measured
-        //               2026-10-05, llvmpipe LLVM 20, Mesa 25.2). That is one
-        //               rounding per fma different from a fused device -- far
-        //               inside the 3e-5 render bar -- and it is reported in
-        //               `capabilities.backend.math_mode`, never silently.
-        // Anything else (some residuals right, some wrong; zeroes on a real
-        // GPU) still refuses to start, as it always did.
-        size_t exact = 0, zero = 0;
-        for (size_t i = 0; i < n; ++i) {
-            // These bounded, positive binary32 inputs have an exact binary64
-            // product (at most 48 significant bits). Subtracting its binary32
-            // rounding is exact by Sterbenz's lemma. This is the exact FMA
-            // residual for this probe, not a general-purpose FMA replacement.
-            // Some MinGW/MSVCRT fmaf implementations give an incorrect answer
-            // here; neither their result nor a tolerance is a valid GPU gate.
-            static_assert(std::numeric_limits<float>::digits == 24);
-            static_assert(std::numeric_limits<double>::digits >= 48);
-            const float a = input[2 * i], b = input[2 * i + 1];
-            const float rounded = a * b;
-            const float want = float(double(a) * double(b) - double(rounded));
-            if (want == 0.0f) continue;   // carries no information either way
-            if (got[i] == want) ++exact;
-            else if (got[i] == 0.0f) ++zero;
-            else {
-                char got_want[96];
-                std::snprintf(got_want, sizeof got_want, " (got %.9g, want %.9g)", double(got[i]), double(want));
-                detail = "Vulkan math probe differs from exact product residual at index " + std::to_string(i) + got_want;
+        auto enabled = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value && std::strcmp(value, "1") == 0;
+        };
+        const bool strict = enabled("SPEKTRAFILM_VULKAN_STRICT_FMA");
+        const bool force_split = enabled("SPEKTRAFILM_VULKAN_FORCE_SPLIT") && !strict;
+        std::string error, fallback_reason = "forced split for validation";
+        if (!force_split) {
+            BufferRef src = upload(input, sizeof input, error);
+            BufferRef dst = alloc(n * sizeof(float), error);
+            if (!src || !dst || !dispatch("spk_math_probe", {Arg::buf(src), Arg::buf(dst)}, n, error)) {
+                detail = "Vulkan math probe failed: " + error;
+                return false;
+            }
+            float got[n];
+            if (!read(dst.get(), 0, got, sizeof got, error)) {
+                detail = "Vulkan math probe readback failed: " + error;
+                return false;
+            }
+            bool exact = true;
+            for (size_t i = 0; i < n; ++i) {
+                // Do not use host fmaf: legacy MinGW implementations can give
+                // the wrong residual. No tolerance is applied to this gate.
+                static_assert(std::numeric_limits<float>::digits == 24);
+                static_assert(std::numeric_limits<double>::digits >= 48);
+                const float a = input[2 * i], b = input[2 * i + 1];
+                const float rounded = a * b;
+                const float want = float(double(a) * double(b) - double(rounded));
+                if (got[i] == want) continue;
+                char values[112];
+                std::snprintf(values, sizeof values, " (got %.9g, want %.9g)", double(got[i]), double(want));
+                fallback_reason = "fma residual differs at index " + std::to_string(i) + values;
+                exact = false;
+                break;
+            }
+            if (exact) {
+                fused_fma_ = 1;
+                detail = "Vulkan probe passed (precise product + fused fma; full shader parity pending)";
+                return true;
+            }
+            if (strict) {
+                detail = fallback_reason + " (SPEKTRAFILM_VULKAN_STRICT_FMA=1)";
                 return false;
             }
         }
-        if (exact && !zero) {
-            fused_fma_ = 1;
-            detail = "Vulkan probe passed (precise product + fused fma; full shader parity pending)";
-            return true;
+        // GLSL.std.450 Fma need not give a single-rounded residual. Measure
+        // the existing Dekker alternative on this device instead of relaxing
+        // the acceptance tolerance or whitelisting a GPU vendor/type.
+        BufferRef src = upload(input, sizeof input, error);
+        BufferRef dst = alloc(2 * n * sizeof(float), error);
+        if (!src || !dst || !dispatch("spk_split_probe", {Arg::buf(src), Arg::buf(dst)}, n, error)) {
+            detail = fallback_reason + "; Vulkan split-product probe failed: " + error;
+            return false;
         }
-        if (zero && !exact && properties_.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
-            // The double-float kernels then take an exact Dekker product
-            // instead of fma (specialization constant 0; see two_prod in
-            // spk_iir_df_acc.comp): without it the IIR blur's low word is lost
-            // and the recursion amplifies it -- 0.4 % on a 257-px constant row.
-            fused_fma_ = 0;
-            detail = "Vulkan probe passed on a CPU device with unfused fma (double-float kernels use an "
-                     "exact Dekker product; full shader parity pending)";
-            probe_cpu_storage_range(detail);
-            return true;
+        float got[2 * n];
+        if (!read(dst.get(), 0, got, sizeof got, error)) {
+            detail = "Vulkan split-product probe readback failed: " + error;
+            return false;
         }
-        if (!exact && !zero) { detail = "Vulkan math probe produced no informative residuals"; return false; }
-        detail = zero && exact ? "Vulkan math probe: fma is fused for some lanes and not others"
-                               : "Vulkan math probe: fma is not fused on a GPU device (fast or contracted math?)";
-        return false;
+        for (size_t i = 0; i < n; ++i) {
+            const float a = input[2 * i], b = input[2 * i + 1];
+            const float rounded = a * b;
+            const float residual = float(double(a) * double(b) - double(rounded));
+            // Check both words, not just their sum: consumers rely on a
+            // rounded high word and its residual, not an arbitrary pair.
+            if (got[2 * i] != rounded || got[2 * i + 1] != residual) {
+                detail = fallback_reason + "; Vulkan split-product probe is not exact at index " + std::to_string(i);
+                return false;
+            }
+        }
+        fused_fma_ = 0;  // commit the choice only after validation succeeds
+        detail = "Vulkan probe passed (exact Dekker split product; " + fallback_reason + "; full shader parity pending)";
+        if (properties_.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) probe_cpu_storage_range(detail);
+        return true;
     }
 
     // lavapipe advertises maxStorageBufferRange = 128 MiB, which refuses any
@@ -401,23 +486,10 @@ public:
     }
 
     void begin_frame() override {
-        // Every render (including an export's full render) starts with a fresh
-        // budget, not the previous frame's idle planes or transfer high-water.
-        // Transfers are synchronous; no submitted work can still name staging.
-        std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
         std::lock_guard<std::mutex> lock(buffers_mutex_);
-        trim_pool_locked(0);
-        destroy_buffer(&upload_staging_);
-        destroy_buffer(&read_staging_);
         frame_high_water_ = 0;
     }
-    void end_frame() override {
-        std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
-        std::lock_guard<std::mutex> lock(buffers_mutex_);
-        trim_pool_locked(0);
-        destroy_buffer(&upload_staging_);
-        destroy_buffer(&read_staging_);
-    }
+    void end_frame() override {}
 
     BufferRef alloc(size_t bytes, std::string& error) override { return allocate(bytes, false, error); }
     BufferRef alloc_zeroed(size_t bytes, std::string& error) override {
@@ -461,6 +533,21 @@ public:
             error = "Vulkan upload count overflows byte size"; return {};
         }
         return upload_persistent(data, count * sizeof(uint32_t), error);
+    }
+    bool try_promote_persistent(Buffer* b, size_t bytes) override {
+        // Same order as trim_pool: finish any synchronous queue submission
+        // before changing how the buffer is reclaimed. Membership is checked
+        // before dereferencing a pointer that might belong to another backend.
+        std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
+        std::lock_guard<std::mutex> lock(buffers_mutex_);
+        if (!b || std::find(buffers_.begin(), buffers_.end(), b) == buffers_.end()) return false;
+        if (b->persistent || b->refs != 1 || b->bytes != bytes || b->requested_bytes != bytes)
+            return false;
+        // Keep the allocation in buffers_ and keep its one reference. Statistics
+        // partition this list by persistent, and release already destroys the
+        // last persistent reference. No allocation/reuse audit event occurred.
+        b->persistent = true;
+        return true;
     }
     // File-backed host pages are a Metal-specific optimisation. This first
     // Vulkan path preserves ownership with ordinary persistent buffers.
@@ -515,11 +602,13 @@ public:
         if (!bytes) return true;
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
         const auto start = diagnostic_start();
-        if (!ensure_staging(read_staging_, bytes, true, error)) return false;
-        if (!submit_sync([&](VkCommandBuffer command) {
+        if (!ensure_staging(read_staging_, std::min(bytes, staging_chunk_bytes_), true, error)) return false;
+        for (size_t offset = 0; offset < bytes;) {
+            const size_t chunk = std::min(bytes - offset, staging_chunk_bytes_);
+            if (!submit_sync([&](VkCommandBuffer command) {
                 device_barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-                VkBufferCopy range{VkDeviceSize(src_offset), 0, VkDeviceSize(bytes)};
+                VkBufferCopy range{VkDeviceSize(src_offset + offset), 0, VkDeviceSize(chunk)};
                 vkCmdCopyBuffer(command, src->handle, read_staging_.handle, 1, &range);
                 VkBufferMemoryBarrier barrier{};
                 barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -529,12 +618,14 @@ public:
                 barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 barrier.buffer = read_staging_.handle;
                 barrier.offset = 0;
-                barrier.size = VkDeviceSize(bytes);
+                barrier.size = VkDeviceSize(chunk);
                 vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                      VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &barrier, 0, nullptr);
             }, "Vulkan host readback", error) ||
-            !mapped_range(read_staging_, bytes, false, error)) return false;
-        std::memcpy(dst, read_staging_.mapped, bytes);
+                !mapped_range(read_staging_, chunk, false, error)) return false;
+            std::memcpy(static_cast<unsigned char*>(dst) + offset, read_staging_.mapped, chunk);
+            offset += chunk;
+        }
         transfer_timing("read", bytes, start);
         return true;
     }
@@ -542,12 +633,11 @@ public:
     bool dispatch(const char* kernel, const std::vector<Arg>& args,
                   size_t n_threads, std::string& error) override {
         if (n_threads == 0) return true;
-        // The specialization the double-float kernels are built with depends
-        // on whether this device fuses fma; learn it before the first one.
-        if (fused_fma_ < 0 && kernel && std::strcmp(kernel, "spk_math_probe") != 0) {
-            std::string detail;
-            if (!check_math_mode(detail)) fused_fma_ = 1;
-        }
+        // Probe kernels must not recurse into the startup gate. A rejected
+        // device stays rejected, including low-level callers that dispatch
+        // without first calling check_math_mode themselves.
+        if (kernel && std::strcmp(kernel, "spk_math_probe") != 0 &&
+            std::strcmp(kernel, "spk_split_probe") != 0 && !check_math_mode(error)) return false;
         const KernelSpec* spec = find_kernel(kernel);
         if (!spec) { error = std::string("Vulkan kernel not ported: ") + (kernel ? kernel : "(null)"); return false; }
         if (args.size() != spec->bindings) {
@@ -662,6 +752,21 @@ public:
         return properties_.limits.maxImageDimension2D;
     }
 
+    uint64_t begin_memory_observation() override {
+        std::lock_guard<std::mutex> lock(buffers_mutex_);
+        const uint64_t token = ++observation_serial_;
+        observations_.emplace(token, MemoryObservation{});
+        update_high_water();
+        return token;
+    }
+    MemoryObservation end_memory_observation(uint64_t token) override {
+        std::lock_guard<std::mutex> lock(buffers_mutex_);
+        const auto it = observations_.find(token);
+        if (it == observations_.end()) return {};
+        const auto result = it->second;
+        observations_.erase(it);
+        return result;
+    }
     PoolStats pool_stats() const override {
         std::lock_guard<std::mutex> lock(buffers_mutex_);
         PoolStats out;
@@ -681,15 +786,10 @@ public:
         return out;
     }
     size_t trim_pool(size_t keep_bytes) override {
+        // Match transfer/dispatch lock order. Every queue submission is
+        // synchronous, so owning this lock also makes staging safe to destroy.
+        std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
         std::lock_guard<std::mutex> lock(buffers_mutex_);
-        return trim_pool_locked(keep_bytes);
-    }
-    bool take_critical_pressure() override { return critical_pressure_.exchange(false); }
-
-private:
-    // Caller owns buffers_mutex_. Never reclaim a live/persistent plane: the
-    // displayed frame and cached negative must remain usable after a failure.
-    size_t trim_pool_locked(size_t keep_bytes) {
         size_t total = 0, freed = 0;
         for (const Buffer* b : buffers_) if (!b->persistent) total += b->bytes;
         std::vector<Buffer*> free;
@@ -703,9 +803,40 @@ private:
             destroy_buffer(b);
             delete b;
         }
+        if (keep_bytes == 0) {
+            const VkDeviceSize staging_freed = upload_staging_.allocation_bytes + read_staging_.allocation_bytes;
+            destroy_buffer(&upload_staging_);
+            destroy_buffer(&read_staging_);
+            if (transfer_timings_ && staging_freed)
+                std::fprintf(stderr, "{\"vulkan_staging_trim\":true,\"freed_bytes\":%llu,"
+                    "\"upload_staging_bytes\":0,\"read_staging_bytes\":0}\n",
+                    static_cast<unsigned long long>(staging_freed));
+        }
         return freed;
     }
+    size_t trim_pool_incompatible(size_t bytes, size_t min_bytes) override {
+        if (bytes <= min_bytes) return 0;
+        // Match trim_pool's lock order; every submission completes before the
+        // dispatch lock is released. Staging and persistent storage stay put.
+        std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
+        std::lock_guard<std::mutex> lock(buffers_mutex_);
+        size_t freed = 0;
+        for (auto it = buffers_.begin(); it != buffers_.end();) {
+            Buffer* b = *it;
+            if (!b->persistent && b->refs == 0 && b->bytes >= min_bytes && b->bytes < bytes) {
+                freed += b->bytes;
+                destroy_buffer(b);
+                delete b;
+                it = buffers_.erase(it);
+            } else ++it;
+        }
+        return freed;
+    }
+    bool take_critical_pressure() override { return critical_pressure_.exchange(false); }
+
+private:
     using Clock = std::chrono::steady_clock;
+    static constexpr size_t kMaxStagingBytes = size_t(64) * 1024 * 1024;
 
     Clock::time_point diagnostic_start() const {
         return transfer_timings_ ? Clock::now() : Clock::time_point{};
@@ -780,18 +911,12 @@ private:
 
     bool ensure_staging(Buffer& staging, size_t bytes, bool readback, std::string& error) {
         if (staging.handle && staging.bytes >= bytes) return true;
-        // Nothing references the old staging after submit_sync. Release it
-        // before growing, rather than briefly paying for both capacities.
+        // The preceding synchronous transfer is complete. Free the previous
+        // block before growing, so growth does not temporarily double staging.
         destroy_buffer(&staging);
         Buffer replacement;
         replacement.bytes = bytes;
-        VkResult failure = VK_SUCCESS;
-        if (!create_buffer(replacement, error, true, readback, &failure)) {
-            if (failure != VK_ERROR_OUT_OF_DEVICE_MEMORY && failure != VK_ERROR_OUT_OF_HOST_MEMORY) return false;
-            trim_pool(0);
-            if (!create_buffer(replacement, error, true, readback)) return false;
-            error.clear();
-        }
+        if (!create_buffer(replacement, error, true, readback)) return false;
         staging = replacement;
         return true;
     }
@@ -840,15 +965,18 @@ private:
         BufferRef out = allocate(bytes, persistent, error);
         if (!out) return {};
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
-        if (!ensure_staging(upload_staging_, bytes, false, error)) return {};
-        if (narrow) {
-            float* dst = static_cast<float*>(upload_staging_.mapped);
-            for (size_t i = 0; i < bytes / sizeof(float); ++i) dst[i] = float(narrow[i]);
-        } else {
-            std::memcpy(upload_staging_.mapped, raw, bytes);
-        }
-        if (!mapped_range(upload_staging_, bytes, true, error)) return {};
-        if (!submit_sync([&](VkCommandBuffer command) {
+        if (!ensure_staging(upload_staging_, std::min(bytes, staging_chunk_bytes_), false, error)) return {};
+        for (size_t offset = 0; offset < bytes;) {
+            const size_t chunk = std::min(bytes - offset, staging_chunk_bytes_);
+            if (narrow) {
+                float* dst = static_cast<float*>(upload_staging_.mapped);
+                for (size_t i = 0; i < chunk / sizeof(float); ++i)
+                    dst[i] = float(narrow[offset / sizeof(float) + i]);
+            } else {
+                std::memcpy(upload_staging_.mapped, static_cast<const unsigned char*>(raw) + offset, chunk);
+            }
+            if (!mapped_range(upload_staging_, chunk, true, error)) return {};
+            if (!submit_sync([&](VkCommandBuffer command) {
                 device_barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
                 VkBufferMemoryBarrier host{};
                 host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -858,13 +986,15 @@ private:
                 host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 host.buffer = upload_staging_.handle;
                 host.offset = 0;
-                host.size = VkDeviceSize(bytes);
+                host.size = VkDeviceSize(chunk);
                 vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_HOST_BIT,
                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &host, 0, nullptr);
-                VkBufferCopy range{0, 0, VkDeviceSize(bytes)};
+                VkBufferCopy range{0, VkDeviceSize(offset), VkDeviceSize(chunk)};
                 vkCmdCopyBuffer(command, upload_staging_.handle, out.get()->handle, 1, &range);
                 transfer_written(command);
             }, "Vulkan upload", error)) return {};
+            offset += chunk;
+        }
         transfer_timing("upload", bytes, start);
         return out;
     }
@@ -876,13 +1006,23 @@ private:
         }
         std::lock_guard<std::mutex> lock(buffers_mutex_);
         if (!persistent) {
+            // Do not retain a full-resolution plane for a small preview or
+            // constant request. Dispatch completion makes zero-ref blocks idle.
+            for (auto it = buffers_.begin(); it != buffers_.end();) {
+                Buffer* b = *it;
+                if (bytes >= (size_t(1) << 20) && !b->persistent && b->refs == 0 && b->bytes > bytes &&
+                    b->bytes - bytes > std::max(bytes, size_t(64) << 20)) {
+                    destroy_buffer(b); delete b; it = buffers_.erase(it);
+                } else ++it;
+            }
             Buffer* best = nullptr;
             for (Buffer* b : buffers_)
                 if (!b->persistent && b->refs == 0 && b->bytes >= bytes &&
-                    b->bytes - bytes <= std::max(bytes, size_t(4096)) &&
+                    b->bytes - bytes <= (bytes < (size_t(64) << 10) ? size_t(4096) : std::max(bytes, size_t(64) << 20)) &&
                     (!best || b->bytes < best->bytes)) best = b;
             if (best) {
                 best->refs = 1;
+                best->requested_bytes = bytes;
                 ++audit_.reuses;
                 audit_.reuse_bytes_requested += bytes;
                 audit_.reuse_bytes_taken += best->bytes;
@@ -896,15 +1036,30 @@ private:
         }
         auto b = std::make_unique<Buffer>();
         b->bytes = bytes;
+        b->requested_bytes = bytes;
         b->persistent = persistent;
-        VkResult failure = VK_SUCCESS;
-        if (!create_buffer(*b, error, false, false, &failure)) {
-            if (failure != VK_ERROR_OUT_OF_DEVICE_MEMORY && failure != VK_ERROR_OUT_OF_HOST_MEMORY) return {};
-            // Retry once, after reclaiming incompatible idle size classes.
-            // Live handles and persistent session data are never discarded.
-            trim_pool_locked(0);
-            if (!create_buffer(*b, error)) return {};
+        bool memory_pressure = false;
+        if (!create_buffer(*b, error, false, false, &memory_pressure)) {
+            if (!memory_pressure) return {};
+            // Already under buffers_mutex_. Synchronous submissions and zero
+            // references make these blocks safe to reclaim. Keep live images,
+            // persistent caches and transfer staging intact for recovery.
+            size_t freed = 0;
+            for (auto it = buffers_.begin(); it != buffers_.end();) {
+                Buffer* idle = *it;
+                if (!idle->persistent && idle->refs == 0) {
+                    freed += idle->allocation_bytes;
+                    destroy_buffer(idle);
+                    delete idle;
+                    it = buffers_.erase(it);
+                } else ++it;
+            }
+            if (!freed) return {};
+            if (std::getenv("SPEKTRAFILM_NODE_MEMORY"))
+                std::fprintf(stderr, "allocation_reclaim requested=%zu freed=%zu\n", bytes, freed);
             error.clear();
+            // One retry only; a genuine live working-set shortage still fails.
+            if (!create_buffer(*b, error)) return {};
         }
         Buffer* raw = b.release();
         buffers_.push_back(raw);
@@ -915,14 +1070,26 @@ private:
     }
 
     void update_high_water() {
-        size_t live = 0;
-        for (const Buffer* b : buffers_) if (!b->persistent && b->refs) live += b->bytes;
+        size_t live = 0, resident = 0, requested = 0;
+        for (const Buffer* b : buffers_) {
+            if (!b->persistent && b->refs) {
+                live += b->bytes;
+                requested += b->requested_bytes;
+            }
+            resident += b->allocation_bytes;
+        }
         frame_high_water_ = std::max(frame_high_water_, live);
+        for (auto& item : observations_) {
+            if (live > item.second.live_peak) item.second.requested_at_live_peak = requested;
+            item.second.requested_live_peak = std::max(item.second.requested_live_peak, requested);
+            item.second.live_peak = std::max(item.second.live_peak, live);
+            item.second.resident_peak = std::max(item.second.resident_peak, resident);
+        }
     }
 
     bool create_buffer(Buffer& b, std::string& error, bool staging = false, bool readback = false,
-                       VkResult* failure = nullptr) {
-        if (failure) *failure = VK_SUCCESS;
+                       bool* memory_pressure = nullptr) {
+        if (memory_pressure) *memory_pressure = false;
         VkBufferCreateInfo create{};
         create.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         create.size = VkDeviceSize(b.bytes);
@@ -931,10 +1098,7 @@ private:
                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         VkResult result = vkCreateBuffer(device_, &create, nullptr, &b.handle);
-        if (result != VK_SUCCESS) {
-            if (failure) *failure = result;
-            error = vk_error("vkCreateBuffer", result); return false;
-        }
+        if (result != VK_SUCCESS) { error = vk_error("vkCreateBuffer", result); return false; }
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(device_, b.handle, &requirements);
         uint32_t memory_index = UINT32_MAX;
@@ -964,6 +1128,29 @@ private:
             return false;
         }
         VkMemoryAllocateInfo allocate_info{};
+#ifdef _WIN32
+        // Device allocations can also consume Windows commit. Leave room for
+        // the editor and for error recovery; physical RAM alone is insufficient.
+        MEMORYSTATUSEX status{}; status.dwLength = sizeof(status);
+        uint64_t reserve = 3ull << 30;
+        // Diagnostic override can only increase protection. Allows recovery
+        // testing without actually exhausting the machine's memory.
+        if (const char* value = std::getenv("SPEKTRAFILM_TEST_COMMIT_RESERVE_GIB")) {
+            if (std::strlen(value) <= 2 && *value >= '0' && *value <= '9') {
+                char* end = nullptr;
+                const unsigned long gib = std::strtoul(value, &end, 10);
+                if (end && !*end && gib >= 3 && gib <= 64) reserve = uint64_t(gib) << 30;
+            }
+        }
+        if (GlobalMemoryStatusEx(&status) &&
+            (status.ullAvailPageFile <= reserve ||
+             requirements.size > status.ullAvailPageFile - reserve)) {
+            error = "Insufficient system commit budget for Vulkan allocation; retain preview and retry after freeing resources";
+            if (memory_pressure) *memory_pressure = true;
+            destroy_buffer(&b);
+            return false;
+        }
+#endif
         allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocate_info.allocationSize = requirements.size;
         allocate_info.memoryTypeIndex = memory_index;
@@ -992,7 +1179,7 @@ private:
             available = std::min(available, memory_limit_bytes_ > owned ? memory_limit_bytes_ - owned : 0);
         if (requirements.size > available) {
             critical_pressure_ = true;
-            if (failure) *failure = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            if (memory_pressure) *memory_pressure = true;
             error = "GPU memory budget exhausted: requested " + std::to_string((requirements.size + ((1u << 20) - 1)) >> 20) +
                     " MiB, available " + std::to_string(available >> 20) +
                     " MiB after safety reserve. Close other GPU applications and retry; "
@@ -1006,11 +1193,9 @@ private:
         if (result == VK_SUCCESS && staging)
             result = vkMapMemory(device_, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped);
         if (result != VK_SUCCESS) {
-            if (failure) *failure = result;
-            if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) critical_pressure_ = true;
             error = vk_error("Vulkan buffer memory", result);
-            if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY)
-                error += "; GPU memory allocation failed. Close other GPU applications and retry.";
+            if (memory_pressure) *memory_pressure =
+                result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY;
             destroy_buffer(&b);
             return false;
         }
@@ -1119,8 +1304,15 @@ private:
     VkPhysicalDeviceProperties properties_{};
     // maxStorageBufferRange, unless probe_cpu_storage_range measured more.
     VkDeviceSize storage_range_limit_ = 0;
-    // -1 not yet probed, 1 fused fma, 0 unfused (accepted on a CPU device only).
+    // -1 unvalidated/rejected, 1 validated fused fma, 0 validated split.
     int fused_fma_ = -1;
+    bool math_checked_ = false;
+    std::string math_detail_;
+    bool properties2_available_ = false;
+    bool memory_budget_available_ = false;
+    uint64_t memory_limit_bytes_ = 0;
+    std::array<std::atomic<uint64_t>, VK_MAX_MEMORY_HEAPS> heap_allocated_{};
+    std::atomic<bool> critical_pressure_{false};
     VkPhysicalDeviceMemoryProperties memory_properties_{};
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
@@ -1131,15 +1323,13 @@ private:
     std::mutex dispatch_mutex_;
     Buffer upload_staging_;
     Buffer read_staging_;
+    size_t staging_chunk_bytes_ = kMaxStagingBytes;
     bool transfer_timings_ = false;
-    bool properties2_available_ = false;
-    bool memory_budget_available_ = false;
-    uint64_t memory_limit_bytes_ = 0;
-    std::array<std::atomic<uint64_t>, VK_MAX_MEMORY_HEAPS> heap_allocated_{};
-    std::atomic<bool> critical_pressure_{false};
     std::vector<Buffer*> buffers_;
     PoolAudit audit_;
     size_t frame_high_water_ = 0;
+    uint64_t observation_serial_ = 0;
+    std::unordered_map<uint64_t, MemoryObservation> observations_;
 };
 
 }  // namespace

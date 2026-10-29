@@ -17,13 +17,6 @@ import {
 const fields = new Map((schema as { name: string; layer: string; type: string; range?: number[] }[]).map((f) => [f.name, f]));
 
 describe('the wire', () => {
-  it('sends CineStill headroom and measured black-and-white grain', () => {
-    const p = { ...FILM_PARAMS_DEFAULT, filmStock: 'kodak_tri_x_400', effects: { ...FILM_PARAMS_DEFAULT.effects, highlightHeadroom: 6 } };
-    expect(fullDelta(p).grain_amount).toBe(1.7);
-    expect(fullDelta(p).halation_headroom_ev).toBe(6);
-    expect(fullDelta({ ...p, effects: { ...p.effects, grain: 2 } }).grain_amount).toBe(2);
-    expect(decodeFilmParams({ effects: { grain: 1 } }).effects.highlightHeadroom).toBe(4);
-  });
   it('names only fields the engine schema declares, on the engine layer, with the right types', () => {
     // Every feature on, every optional row present.
     const p = {

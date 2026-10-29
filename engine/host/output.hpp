@@ -11,9 +11,12 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <optional>
+#include "exif_fields.hpp"
 
 #include "spektrafilm/spk_engine.h"
 
@@ -31,13 +34,10 @@ public:
     // Encoded source RGBA16 (row stride in pixels) -> linear target RGB float.
     void to_linear(const uint16_t* rgba16, uint32_t width, uint32_t height, uint32_t stride_px,
                    std::vector<float>& rgb) const;
-    // Already-linear source RGB (the original decode) -> linear target RGB.
-    void convert_linear(const std::vector<float>& source, std::vector<float>& rgb) const;
     // Linear target RGB -> encoded target, then quantised.
     void encode_rgba8(const std::vector<float>& rgb, std::vector<uint8_t>& rgba) const;
     void encode_rgba16(const std::vector<float>& rgb, std::vector<uint16_t>& rgba) const;
     uint32_t target_mode() const { return dst_mode_; }
-    const std::array<float, 9>& matrix() const { return matrix_; }
 
 private:
     std::string src_, dst_;
@@ -65,6 +65,8 @@ bool icc_for(const std::string& engine_space, const std::filesystem::path& resou
 struct Exif {
     std::string make, model, lens, datetime_original;   // EXIF "YYYY:MM:DD HH:MM:SS"
     double iso = 0, shutter_s = 0, aperture = 0, focal_mm = 0;   // 0 = absent
+    std::optional<double> exposure_program, exposure_bias_ev, focal_35mm;
+    ExifValues extra;
 };
 
 // Interleaved 3-channel encoded samples. `exif` may be null.
@@ -76,6 +78,24 @@ bool encode_png8(const uint8_t* rgb, uint32_t width, uint32_t height, const std:
 bool encode_jpeg(const uint8_t* rgb, uint32_t width, uint32_t height, int quality,
                  const std::vector<uint8_t>& icc, std::vector<uint8_t>& out, std::string& error,
                  const Exif* exif = nullptr);
+// Streaming counterparts. The caller opens a temporary file, owns fclose and
+// commits it only on success. These do not close or rename the supplied file.
+bool encode_tiff_file(std::FILE* file, const void* rgb, uint32_t width, uint32_t height, uint32_t bits,
+                      const std::vector<uint8_t>& icc, std::string& error, const Exif* exif = nullptr);
+struct TiffOptions { bool lzw = false, embed_preview = false; };
+bool encode_tiff_file(std::FILE* file, const void* rgb, uint32_t width, uint32_t height, uint32_t bits,
+                      const std::vector<uint8_t>& icc, const TiffOptions& options,
+                      std::string& error, const Exif* exif = nullptr);
+// A dedicated Cineon file: untagged 16-bit log codes, EXIF uncalibrated, and
+// a reduced sRGB view in IFD1. The preview never replaces the primary codes.
+bool encode_cineon_file(std::FILE* file, const void* rgb16, uint32_t width, uint32_t height,
+                        const uint8_t* preview_rgb, uint32_t preview_width, uint32_t preview_height,
+                        const std::vector<uint8_t>& preview_icc, std::string& error,
+                        const Exif* exif = nullptr, bool lzw = false);
+bool encode_png8_file(std::FILE* file, const uint8_t* rgb, uint32_t width, uint32_t height,
+                      const std::vector<uint8_t>& icc, std::string& error, const Exif* exif = nullptr);
+bool encode_jpeg_file(std::FILE* file, const uint8_t* rgb, uint32_t width, uint32_t height, int quality,
+                      const std::vector<uint8_t>& icc, std::string& error, const Exif* exif = nullptr);
 // A complete little-endian TIFF-structured EXIF block (JPEG APP1 after
 // "Exif\0\0", PNG eXIf).
 std::vector<uint8_t> exif_block(const Exif& exif, uint32_t width, uint32_t height);

@@ -45,9 +45,9 @@
   --fs-action: calc(13.11px * var(--ui-scale));
 
   /* Metrics */
-  --left-width: 280px;
+  --left-width: 254px;
   --right-width: 288px;
-  --filmstrip-height: 132px;
+  --filmstrip-height: calc(132px + 18px * var(--ui-scale));
   --header-height: 38px;
   --section-header: 26px;
   --row-height: calc(22px * var(--ui-scale));
@@ -62,14 +62,6 @@
   --font-ui: 'Segoe UI Variable Text', 'Segoe UI', 'Inter', 'Noto Sans', 'Cantarell', 'Ubuntu', 'DejaVu Sans',
     'Noto Sans CJK SC', 'Source Han Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', system-ui, sans-serif;
   --font-mono: 'Cascadia Mono', 'Consolas', 'DejaVu Sans Mono', 'Noto Sans Mono', ui-monospace, monospace;
-}
-
-.placement-usable {
-  position: absolute;
-  top: 50%;
-  height: 2px;
-  background: var(--accent);
-  pointer-events: none;
 }
 
 * {
@@ -165,6 +157,10 @@ input {
   min-height: 0;
   background: var(--ground);
 }
+.panel-resize { position: absolute; top: 0; bottom: 0; width: 6px; z-index: 20; cursor: col-resize; touch-action: none; }
+.panel-resize.left { left: -3px; }
+.panel-resize.right { right: -3px; }
+.panel-resize:hover::after, .panel-resize:focus::after { content: ''; position: absolute; left: 2px; top: 0; bottom: 0; width: 1px; background: var(--accent); }
 
 /* ----------------------------------------------------------------- top bar */
 
@@ -226,13 +222,61 @@ input {
   padding-left: 12px;
 }
 .zoom-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
   min-width: 41px;
-  height: 21px;
-  padding: 0 7px;
+  min-height: calc(22px * var(--ui-scale));
+  padding: 2px 8px;
   border-radius: 999px;
   background: var(--pill);
   font-size: var(--fs-body);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  line-height: 1.2;
+}
+/* The centre can be much narrower than the window when both rails are wide.
+   Wrap whole tool groups; keep the filename on its own line at every scale. */
+.editor-topbar {
+  height: auto;
+  display: block;
+  padding: 5px 10px;
+}
+.topbar-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 12px;
+}
+.topbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+.topbar-group > button {
+  flex: none;
+  white-space: nowrap;
+}
+.topbar-process-group { gap: 10px; }
+.topbar-display-group { margin-left: auto; }
+.topbar-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 3px;
+}
+.editor-topbar .bar-status {
+  display: block;
+  padding-left: 0;
+  min-height: 1.4em;
+  line-height: 1.4;
+}
+.topbar-info > button {
+  flex: none;
+  white-space: nowrap;
 }
 
 /* ------------------------------------------------------------------ canvas */
@@ -263,6 +307,22 @@ input {
   pointer-events: none;
   text-align: center;
   padding: 24px;
+}
+.canvas-empty {
+  flex-direction: column;
+  gap: calc(14px * var(--ui-scale));
+}
+.canvas-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: calc(10px * var(--ui-scale));
+  pointer-events: auto;
+}
+.canvas-empty-actions .btn {
+  height: auto;
+  min-height: calc(32px * var(--ui-scale));
+  padding: calc(7px * var(--ui-scale)) calc(16px * var(--ui-scale));
 }
 .canvas-corner {
   position: absolute;
@@ -346,7 +406,7 @@ input {
   gap: 10px;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 0 6px;
+  padding: 4px 6px calc(18px * var(--ui-scale));
   height: 100%;
   align-items: center;
   scrollbar-width: thin;
@@ -392,6 +452,15 @@ input {
   height: 100%;
   color: var(--text);
 }
+
+.clipboard-actions {
+  flex-wrap: wrap;
+  gap: 6px;
+  height: auto;
+  min-height: var(--row-height);
+  padding-block: 4px;
+}
+.clipboard-actions .btn { flex: 1 0 auto; white-space: nowrap; }
 
 /* ---------------------------------------------------------------- sections */
 
@@ -463,19 +532,24 @@ input {
   opacity: var(--disabled-opacity);
   pointer-events: none;
 }
+/* A label column is a minimum, never a clip (no "…"; `.fixedSize().frame(minWidth:)` on the Mac):
+   a longer label such as 1.3.4's "Highlight Headroom" takes its room from the track. */
 .row-label {
-  width: var(--label-width);
+  min-width: var(--label-width);
   flex: none;
   font-weight: 600;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 .rail.right .row-label {
-  width: var(--param-label-width);
+  min-width: var(--param-label-width);
 }
+/* A sub-label is a message: it wraps inside the label's column and never widens the row
+   (width 0 + min-width 100 % keeps it out of the label's intrinsic width). */
 .row-label .sub {
   display: block;
+  white-space: normal;
+  width: 0;
+  min-width: 100%;
   font-weight: 400;
   font-size: var(--fs-small);
   color: var(--dim);
@@ -492,7 +566,8 @@ input {
   height: 18px;
   position: relative;
   cursor: ew-resize;
-  min-width: 40px;
+  /* 24, not 40: at 130 % on the narrowest left rail (232) the track gave way 13 px too late. */
+  min-width: 24px;
 }
 .scrub .track {
   position: absolute;
@@ -502,6 +577,16 @@ input {
   height: 1.36px;
   margin-top: -0.68px;
   background: var(--dim);
+}
+.scrub .usable {
+  position: absolute;
+  top: 4px;
+  height: 10px;
+  box-sizing: border-box;
+  border-top: 1px solid var(--accent);
+  border-bottom: 1px solid var(--accent);
+  opacity: 0.6;
+  pointer-events: none;
 }
 .scrub .blocked {
   position: absolute;
@@ -578,6 +663,9 @@ input {
 .toggle-row .row-label {
   width: auto;
   flex: 1;
+  /* The switch is the whole row: a long label wraps rather than pushing the box out. */
+  min-width: 0;
+  white-space: normal;
 }
 .unit-field {
   width: 50px;
@@ -589,12 +677,6 @@ input {
   font-size: var(--fs-small);
   text-align: center;
   user-select: text;
-}
-.unit-field.text-field {
-  flex: 1;
-  min-width: 0;
-  text-align: left;
-  padding: 0 6px;
 }
 
 /* menus (Radix dropdown) */
@@ -641,6 +723,11 @@ input {
 }
 
 /* stock lists */
+.stock-list {
+  display: flex;
+  flex-direction: column;
+  gap: calc(3px * var(--ui-scale));
+}
 .stock-group {
   color: var(--dim);
   font-size: var(--fs-body);
@@ -670,6 +757,7 @@ input {
 }
 .stock-row .name {
   flex: 1;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -679,6 +767,19 @@ input {
   height: 18px;
   object-fit: cover;
   border-radius: 2px;
+}
+.stock-list .stock-row {
+  flex: none;
+  height: auto;
+  min-height: calc(24px * var(--ui-scale));
+  padding-top: calc(3px * var(--ui-scale));
+  padding-bottom: calc(3px * var(--ui-scale));
+}
+.stock-list .stock-row img.cover {
+  flex: none;
+  width: calc(18px * var(--ui-scale));
+  height: calc(18px * var(--ui-scale));
+  object-fit: contain;
 }
 .cine-pill {
   font-size: 6px;
@@ -939,3 +1040,19 @@ input {
   background: var(--export-chip);
   color: var(--text);
 }
+.pair-layer { width: 100%; text-align: left; border: 0; border-radius: 5px; background: transparent; color: var(--text); }
+.pair-layer.selected { background: var(--well); }
+.pair-layer .caption { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pair-picker { max-height: 280px; overflow: auto; background: var(--well); border-radius: 6px; padding: 6px; }
+.pair-picker > button { width: 100%; text-align: left; }
+.pair-context { position: absolute; z-index: 20; display: flex; flex-direction: column; padding: 4px; }
+.pair-context button { text-align: left; background: transparent; color: var(--text); border: 0; padding: 6px 12px; }
+.pair-context button:hover { background: var(--well); }
+
+.drop-import-dialog { width: min(740px, 94vw); }
+.drop-import-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+.drop-import-search { width: 100%; padding: 6px 8px; }
+.drop-import-list { max-height: 42vh; overflow-y: auto; }
+.drop-import-file { display: flex; gap: 10px; align-items: center; padding: 8px 4px; border-bottom: 1px solid var(--rule); }
+.drop-import-file span { min-width: 0; overflow-wrap: anywhere; }
+.drop-import-file small { display: block; color: var(--dim); font-size: 10px; }

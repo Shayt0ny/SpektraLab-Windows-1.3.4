@@ -18,13 +18,14 @@
 //                 error, weave, scan rotation/offset, fog and leak realisation,
 //                 and (on 120, which is not sprocket-locked) where the edge
 //                 numbers land.
-// Text is rasterised with CoreText/CoreGraphics.
-#ifdef __APPLE__
+// Apple keeps its native rasterizer; the portable adapter embeds pinned open
+// font outlines and rasterizes the same film-space drawing operations.
+#if defined(__APPLE__) && !defined(SPK_VULKAN_BACKEND)
 #include <Accelerate/Accelerate.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreText/CoreText.h>
 #else
-#include "edge_raster.hpp"
+#include "imprint_raster.hpp"
 #endif
 
 #include <algorithm>
@@ -39,6 +40,8 @@
 namespace spk {
 
 namespace {
+
+constexpr double kPi = 3.141592653589793238462643383279502884;
 
 // Indices into the kernel parameter block; `overscan.metal` mirrors them.
 enum OsP : int {
@@ -89,7 +92,7 @@ struct Rng {
     double uni(double a, double b) { return a + (b - a) * uni(); }
     double normal() {
         const double u1 = std::max(uni(), 1e-12), u2 = uni();
-        return std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * M_PI * u2);
+        return std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * kPi * u2);
     }
 };
 uint64_t stream(uint64_t seed, uint64_t level, uint64_t purpose) {
@@ -501,6 +504,28 @@ void Pipeline::overscan_frame(uint32_t& frame_w, uint32_t& frame_h) const {
     frame_h = laid ? overscan_.frame_h : 0;
 }
 
+bool Pipeline::full_output_size(uint32_t w, uint32_t h, uint32_t& out_w, uint32_t& out_h,
+                                std::string& error) {
+    const auto& g = params_.io.geometry;
+    out_w = std::max(1u, uint32_t(std::lround(g.crop_w * w)));
+    out_h = std::max(1u, uint32_t(std::lround(g.crop_h * h)));
+    if (g.quarter_turns % 2) std::swap(out_w, out_h);
+    if (!overscan_wanted()) return true;
+    // Deterministic CPU layout only. Restore the current tier on every exit.
+    auto saved = std::move(overscan_);
+    const auto source = source_long_edge_, full = frame_long_edge_;
+    const auto pitch = pixel_size_um_;
+    struct Restore {
+        Pipeline* p; OverscanLayout& layout; uint32_t source, full; double pitch;
+        ~Restore() { p->overscan_ = std::move(layout); p->source_long_edge_ = source;
+            p->frame_long_edge_ = full; p->pixel_size_um_ = pitch; }
+    } restore{this, saved, source, full, pitch};
+    set_source_shape(w, h, w, h);
+    if (!overscan_layout(out_w, out_h, error)) return false;
+    out_w = overscan_.canvas_w; out_h = overscan_.canvas_h;
+    return true;
+}
+
 bool Pipeline::set_overscan_frame(uint32_t frame_w, uint32_t frame_h, std::string& error) {
     if (!overscan_wanted() || frame_w == 0 || frame_h == 0) return true;
     if (overscan_.valid && overscan_.frame_w == frame_w && overscan_.frame_h == frame_h &&
@@ -581,7 +606,7 @@ bool Pipeline::overscan_layout(uint32_t frame_w, uint32_t frame_h, std::string& 
     for (int side = 0; side < 4; ++side)
         for (int k = 0; k < 3; ++k) {
             L.wob_a[side][k] = rc.normal() * 0.012 / double(k + 1);
-            L.wob_ph[side][k] = rc.uni(0.0, 2.0 * M_PI);
+            L.wob_ph[side][k] = rc.uni(0.0, 2.0 * kPi);
         }
     // The gate sits a fraction of a millimetre in front of the emulsion; its
     // shadow's radius is gap / (2 N). EXIF gives N; f/5.6 when unknown.
@@ -659,8 +684,8 @@ bool Pipeline::overscan_layout(uint32_t frame_w, uint32_t frame_h, std::string& 
     // 0.35; 6x12 is held to 0.27 and 6x17 to 0.18 -- a long strip in a holder
     // does not sit like a wedge.
     const double half_along = 0.5 * along_px * L.px;
-    const double tilt_lim = std::min(0.35, std::asin(std::min(1.0, 0.27 / half_along)) * 180.0 / M_PI);
-    L.scan_rot = std::clamp(rf.normal() * 0.14, -tilt_lim, tilt_lim) * M_PI / 180.0;
+    const double tilt_lim = std::min(0.35, std::asin(std::min(1.0, 0.27 / half_along)) * 180.0 / kPi);
+    L.scan_rot = std::clamp(rf.normal() * 0.14, -tilt_lim, tilt_lim) * kPi / 180.0;
     const double ds = rf.normal() * 0.08, dt = rf.normal() * 0.06;
     const double cu = 0.5 * L.canvas_w * L.px, cv = 0.5 * L.canvas_h * L.px;
     const double c = std::cos(L.scan_rot), sn = std::sin(L.scan_rot);
@@ -760,7 +785,7 @@ bool Pipeline::overscan_layout(uint32_t frame_w, uint32_t frame_h, std::string& 
         // the black lifts at the edge (2-6 % linear for white holes, less for
         // black ones), and over what distance (0.02-0.035 mm).
         L.wall_t = 0.125;
-        const double ang = rl.uni(0.0, 2.0 * M_PI);
+        const double ang = rl.uni(0.0, 2.0 * kPi);
         L.wall_tilt[0] = std::cos(ang);
         L.wall_tilt[1] = std::sin(ang);
         L.wall_parallax = 0.0;
@@ -860,7 +885,7 @@ void film_to_canvas_px(const OverscanLayout& L, double s, double t, double& x, d
     y = v / L.px;
 }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(SPK_VULKAN_BACKEND)
 CFAttributedStringRef make_text(const Op& op, CTFontRef font, double gain) {
     CFStringRef str = CFStringCreateWithCString(nullptr, op.text.c_str(), kCFStringEncodingUTF8);
     CGFloat white[] = {CGFloat(std::clamp(gain, 0.0, 1.0)), 1.0};
@@ -875,6 +900,7 @@ CFAttributedStringRef make_text(const Op& op, CTFontRef font, double gain) {
     CFRelease(attrs); CFRelease(kern); CFRelease(col); CFRelease(gray); CFRelease(str);
     return as;
 }
+
 #endif
 
 // Rasterise one group into a canvas-aligned coverage bitmap (its bounding box).
@@ -896,7 +922,7 @@ bool rasterise(const OverscanLayout& L, const Group& g, std::vector<float>& cov,
         } else {
             const double len = (0.75 * op.size_mm * op.hscale + op.tracking_mm * (op.scale_advances ? op.hscale : 1.0)) *
                                double(op.text.size()) + op.size_mm;
-            const double r = op.rot_deg * M_PI / 180.0;
+            const double r = op.rot_deg * kPi / 180.0;
             const double ex = std::cos(r), ey = std::sin(r);
             for (double a : {-0.3 * op.size_mm, len})
                 for (double b : {-1.1 * op.size_mm, 0.4 * op.size_mm})
@@ -911,8 +937,8 @@ bool rasterise(const OverscanLayout& L, const Group& g, std::vector<float>& cov,
     w = x1 - x0; h = y1 - y0;
     if (w <= 0 || h <= 0) return false;
 
-#ifdef __APPLE__
     std::vector<uint8_t> px(size_t(w) * size_t(h), 0);
+#if defined(__APPLE__) && !defined(SPK_VULKAN_BACKEND)
     CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
     CGContextRef ctx = CGBitmapContextCreate(px.data(), size_t(w), size_t(h), 8, size_t(w), gray,
                                              kCGImageAlphaNone);
@@ -957,7 +983,7 @@ bool rasterise(const OverscanLayout& L, const Group& g, std::vector<float>& cov,
         CTLineRef line = CTLineCreateWithAttributedString(as);
         CGContextSaveGState(ctx);
         CGContextTranslateCTM(ctx, op.s, op.t);
-        CGContextRotateCTM(ctx, op.rot_deg * M_PI / 180.0);
+        CGContextRotateCTM(ctx, op.rot_deg * kPi / 180.0);
         if (op.scale_advances) CGContextScaleCTM(ctx, op.hscale, 1.0);
         CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(op.scale_advances ? 1.0 : op.hscale, -1.0));   // t is down; glyphs are up
         CGContextSetTextPosition(ctx, 0, 0);
@@ -966,6 +992,36 @@ bool rasterise(const OverscanLayout& L, const Group& g, std::vector<float>& cov,
         CFRelease(line); CFRelease(as); CFRelease(font);
     }
     CGContextRelease(ctx);
+#else
+    for (const Op& op : g.ops) {
+        imprint::Contours paths;
+        if (op.kind == Op::Poly) {
+            paths.emplace_back();
+            for (size_t k=0;k+1<op.pts.size();k+=2) paths.back().push_back({op.pts[k],op.pts[k+1]});
+        } else if (op.kind == Op::Circle) {
+            paths.emplace_back();
+            // Sagitta < .05 canvas pixel; enough for the eight-row coverage
+            // raster while keeping full-width dot-print groups inexpensive.
+            const int segments=std::clamp(int(std::ceil(kPi*std::sqrt(std::max(0.0,op.size_mm/L.px)/.1))),12,512);
+            for (int k=0;k<segments;++k) {
+                const double a=2*kPi*k/segments;
+                paths.back().push_back({op.pts[0]+op.size_mm*std::cos(a),op.pts[1]+op.size_mm*std::sin(a)});
+            }
+        } else {
+            paths=imprint::text_outlines(op.font,op.size_mm,op.text,op.tracking_mm,
+                                         op.hscale,op.scale_advances,L.px*.05);
+            const double r=op.rot_deg*kPi/180.0,cs=std::cos(r),sn=std::sin(r);
+            for (auto& path:paths) for (auto& pt:path) {
+                const double x=pt.x,y=pt.y;
+                pt={op.s+x*cs-y*sn,op.t+x*sn+y*cs};
+            }
+        }
+        for (auto& path:paths) for (auto& pt:path) {
+            double x,y;film_to_canvas_px(L,pt.x,pt.y,x,y);pt={x-x0,y-y0};
+        }
+        imprint::fill(px,w,h,paths,op.gain);
+    }
+#endif
 
     cov.resize(px.size());
     for (size_t i = 0; i < px.size(); ++i) cov[i] = float(px[i]) * (1.0f / 255.0f);
@@ -982,6 +1038,7 @@ bool rasterise(const OverscanLayout& L, const Group& g, std::vector<float>& cov,
         double sum = 0.0;
         for (int i = -r; i <= r; ++i) { k[size_t(i + r)] = float(std::exp(-0.5 * i * i / (sigma * sigma))); sum += k[size_t(i + r)]; }
         for (float& v : k) v = float(v / sum);
+#if defined(__APPLE__) && !defined(SPK_VULKAN_BACKEND)
         std::vector<float> tmp(cov.size(), 0.0f);
         vImage_Buffer src{cov.data(), vImagePixelCount(h), vImagePixelCount(w), size_t(w) * sizeof(float)};
         vImage_Buffer dst{tmp.data(), vImagePixelCount(h), vImagePixelCount(w), size_t(w) * sizeof(float)};
@@ -991,58 +1048,10 @@ bool rasterise(const OverscanLayout& L, const Group& g, std::vector<float>& cov,
             vImageConvolve_PlanarF(&dst, &src, nullptr, 0, 0, k.data(), taps, 1, 0.0f, kvImageEdgeExtend)
                 != kvImageNoError)
             return false;
-    }
 #else
-    // The same picture without CoreGraphics, CoreText or vImage
-    // (edge_raster.hpp): the CTM chain above as one affine map, each op
-    // filled and composited in turn, the same Gaussian.
-    const double sigma = g.blur_mm / L.px;
-    {
-        const double a = L.A[0], b = L.A[1], c = L.A[2], d = L.A[3], det = a * d - b * c;
-        const edge::Affine film_to_px = edge::Affine::translate(-x0, -y0)
-            .then_after(edge::Affine::scale(1.0 / L.px, 1.0 / L.px))
-            .then_after(edge::Affine::translate(L.cu, L.cv))
-            .then_after(edge::Affine{d / det, -c / det, -b / det, a / det, 0, 0})
-            .then_after(edge::Affine::translate(-L.cs, -L.ct));
-        const double px_per_mm = std::sqrt(std::fabs(film_to_px.a * film_to_px.d - film_to_px.b * film_to_px.c));
-        edge::Canvas canvas(w, h);
-        for (const Op& op : g.ops) {
-            std::vector<edge::Contour> path;
-            if (op.kind == Op::Poly) {
-                edge::Contour contour;
-                for (size_t k = 0; k + 1 < op.pts.size(); k += 2)
-                    contour.push_back(film_to_px.apply({op.pts[k], op.pts[k + 1]}));
-                path.push_back(std::move(contour));
-            } else if (op.kind == Op::Circle) {
-                edge::Contour contour = edge::circle({op.pts[0], op.pts[1]}, op.size_mm, px_per_mm);
-                for (edge::Point& q : contour) q = film_to_px.apply(q);
-                path.push_back(std::move(contour));
-            } else {
-                // CTM: about (s, t), turned, and the whole line widened when
-                // the advances scale; the text matrix widens only the glyphs
-                // and turns y up (t is down; glyphs are up).
-                edge::Affine to_px = film_to_px
-                    .then_after(edge::Affine::translate(op.s, op.t))
-                    .then_after(edge::Affine::rotate(op.rot_deg * M_PI / 180.0));
-                if (op.scale_advances) to_px = to_px.then_after(edge::Affine::scale(op.hscale, 1.0));
-                to_px = to_px.then_after(edge::Affine::scale(1.0, -1.0));
-                if (!edge::text_outline(op.font, op.size_mm, op.text, op.tracking_mm,
-                                        op.scale_advances ? 1.0 : op.hscale, to_px, path))
-                    return false;
-            }
-            canvas.fill(path, op.gain);
-        }
-        canvas.coverage(cov);
-    }
-    if (sigma > 0.3) {
-        const int r = int(std::ceil(3.0 * sigma));
-        std::vector<float> k(size_t(2 * r + 1));
-        double sum = 0.0;
-        for (int i = -r; i <= r; ++i) { k[size_t(i + r)] = float(std::exp(-0.5 * i * i / (sigma * sigma))); sum += k[size_t(i + r)]; }
-        for (float& v : k) v = float(v / sum);
-        edge::blur(cov, w, h, k);
-    }
+        imprint::gaussian(cov,w,h,k);
 #endif
+    }
     return true;
 }
 
@@ -1431,7 +1440,7 @@ double dot_text(const std::string& text, const DotFace& f, double ps, double pt,
 
 // A Helvetica-family string's advance in film mm, as CoreText lays it out.
 double text_width(const char* font, double size_mm, const std::string& text, double tracking_mm, double hscale) {
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(SPK_VULKAN_BACKEND)
     Op op;
     op.font = font; op.size_mm = size_mm; op.text = text; op.tracking_mm = tracking_mm;
     CFStringRef fname = CFStringCreateWithCString(nullptr, font, kCFStringEncodingUTF8);
@@ -1443,12 +1452,7 @@ double text_width(const char* font, double size_mm, const std::string& text, dou
     CFRelease(line); CFRelease(as); CFRelease(f);
     return w * hscale;
 #else
-    double w = 0.0;
-    // A font that will not load still lays the marks out; rasterise() then
-    // refuses to draw them, which the render reports.
-    if (!edge::text_width(font, size_mm, text, tracking_mm, w))
-        w = (0.6 * size_mm + tracking_mm) * double(text.size());
-    return w * hscale;
+    return imprint::text_width(font,size_mm,text,tracking_mm,hscale);
 #endif
 }
 
@@ -2102,7 +2106,7 @@ void imprint_groups(const OverscanLayout& L, const Params& params, double frame_
     auto draw = [&](const std::string& text, const std::string& style, double h, auto place) {
         if (style == "lcd") {
             Op proto;
-            proto.skew = std::tan(8.0 * M_PI / 180.0);
+            proto.skew = std::tan(8.0 * kPi / 180.0);
             std::vector<Op> segs;
             seven_seg_polys(text, h, 0.0, 0.0, proto, segs);
             for (Op& op : segs) {
@@ -2203,7 +2207,7 @@ void imprint_groups(const OverscanLayout& L, const Params& params, double frame_
         // Kept inside the frame: a large face or an inset past the frame's
         // middle would otherwise carry the text off its edge. Text wider than
         // the frame starts at its left and is clipped by the gate.
-        const double over = (d.style == "lcd" ? h * std::tan(8.0 * M_PI / 180.0) : 0.0) + 0.1;   // the slant, and the blur
+        const double over = (d.style == "lcd" ? h * std::tan(8.0 * kPi / 180.0) : 0.0) + 0.1;   // the slant, and the blur
         const double s0 = std::clamp(right ? fs + fw - d.inset_x - w : fs + d.inset_x, fs + 0.1, std::max(fs + 0.1, fs + fw - w - over));
         const double base = std::clamp(bottom ? ft + fh - d.inset_y : ft + d.inset_y + h, std::min(ft + h + 0.1, ft + fh - 0.1), ft + fh - 0.1);
         draw(date_text, d.style, h, [&](double x, double y, double& ss, double& tt) {

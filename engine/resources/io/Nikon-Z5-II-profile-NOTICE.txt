@@ -1,0 +1,19 @@
+Nikon Z5 II (LibRaw normalized model Z5_2) D65 colour matrix
+
+Source: RawSpeed, darktable-org/rawspeed, data/cameras.xml
+Pinned commit: c48d5a6227a1369b633b86bc6707cb0e11d2150b
+https://github.com/darktable-org/rawspeed/blob/c48d5a6227a1369b633b86bc6707cb0e11d2150b/data/cameras.xml
+Entry: NIKON CORPORATION / NIKON Z5_2 / 14bit-compressed
+Rows: 13133 -5542 -1280; -4325 12543 1972; 34 792 7662
+Scale: 10000, XYZ to camera under D65.
+
+Attribution: RawSpeed contributors, darktable-org/rawspeed.
+The source camera data is licensed Creative Commons Attribution-ShareAlike
+3.0 Unported, as declared in cameras.xml. The nine matrix coefficients are
+reused without changing their values; sensor black/white/crop data from the
+entry is not reused. Preserve this notice with redistributed camera data.
+https://creativecommons.org/licenses/by-sa/3.0/
+
+SpektraLab Windows maintenance: shayt0ny. This compatibility entry is used
+only when LibRaw has no matrix for the exact Nikon Z5_2 model. Existing
+camera/file profiles take precedence. No film or paper profile is changed.

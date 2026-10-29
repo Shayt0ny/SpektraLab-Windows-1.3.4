@@ -1,125 +1,149 @@
-# Vulkan memory protection (Windows/Linux)
+# Windows memory residency follow-up (2026-10-18)
 
-The render boundary used by interactive filters and ordinary full-resolution
-image export now discards idle compute buffers and upload/readback staging
-before starting. It also drops inactive tiers in the current session. These
-are disposable image caches; edits and the current negative are retained.
-Render temporaries are released before end-of-frame cleanup on success and
-failure. Vulkan results own CPU pixels, so an already returned frame remains
-valid during cleanup.
+This change keeps the film model, float32 processing, default effects, RAW
+algorithm/thread budget and output formats. It does not introduce overlapping
+RAW decoding, GPU renders or encoders. The public C ABI is unchanged.
 
-On drivers exposing `VK_EXT_memory_budget`, every fresh allocation re-queries
-the selected heap's current budget and usage. A reserve of 5% of that budget,
-capped at 256 MiB, is left for the display and other applications. The budget
-is advisory and can change immediately after the query; real allocation
-failures are still handled. Vulkan 1.0 devices without the extension retain
-allocation-failure recovery without claiming to know global available VRAM.
+## Allocation lifetimes
 
-An allocation that fails for device/host memory first frees incompatible idle
-pooled buffers and retries once. A second failure returns an actionable error
-instead of an unbounded retry. Reprint failures are propagated instead of
-starting another full film render. Staging growth releases its old capacity
-before replacement because transfers are synchronous. Tiny parameters no
-longer reuse a full image plane: reuse slack is bounded to the larger of the
-requested size or 4096 bytes.
+- Compatible16 decoding destroys LibRaw after validating its independently
+  owned RGB16 output and capturing metadata, before allocating float RGB.
+  The headroom conversion still needs the LibRaw image and is unchanged.
+- Vulkan upload/readback use at most 64 MiB per staging buffer (128 MiB total),
+  transferring larger images in synchronous chunks. Narrowing double input to
+  float also happens by chunk, without a second full float vector. Memory
+  dependencies and noncoherent flush/invalidate remain explicit.
+- The worker trims unused GPU scratch and staging before decoding another
+  source, after five seconds of inactivity, and under Windows memory pressure
+  (available physical memory below max(512 MiB, 10% total), or available commit
+  below 512 MiB). Diagnostic polling does not reset the inactivity timer.
+  Closing the last engine session also trims unused memory immediately.
+  Live source, negative and print buffers are never trimmed.
+- Complete-frame TIFF8/TIFF16 export writes its unchanged uncompressed layout
+  directly from the readback in <=1 MiB chunks through the existing atomic
+  writer. It does not allocate a second whole-file byte vector. Legacy memory
+  encoding interfaces remain available.
+- Before a private batch source is decoded, existing editors' unique source,
+  tier, negative and print planes are saved as exact bytes to a session-owned
+  temporary file. Full-tier/source aliases are deduplicated. GPU references
+  are dropped only after all writes succeed. An 8 MiB CPU chunk bounds the
+  transfer workspace; the pipeline, parameters and random state remain alive.
+  The next pixel-consuming editor operation restores lazily; metadata/progress
+  queries do not restore pixels or postpone idle trimming. Re-decoding also
+  keeps the old snapshot on disk until its replacement is ready. Partial restore failure discards
+  partial GPU allocations and keeps the disk snapshot for retry. Closing a
+  suspended editor removes the file without restoring it. Windows uses an
+  exclusive Unicode-path file with delete-on-close lifetime.
 
-This does not lower export resolution, change profiles/shader mathematics,
-or guarantee that every image fits. In particular, 7168 x 10240 is 73,400,320
-pixels: one RGB float32 plane alone is 880,803,840 bytes (840 MiB), and effects
-need several concurrent planes. Live/persistent data is never freed to force
-an allocation through. The previous automatic stripe-budget limitation still
-exists; this change does not silently enable a different rendering path.
+The disk snapshot costs I/O and potentially reclaimable OS file cache; it is
+not free memory. `memory_report.suspended_bytes` and per-session residency
+fields report it separately from GPU `total_bytes`. The GPU pool ledger still
+excludes staging. `SPEKTRAFILM_TRANSFER_TIMINGS=1` records staging allocations
+and trims; leave it off for timing. Diagnostic
+`SPEKTRAFILM_VULKAN_STAGING_BYTES` accepts a 4-byte-aligned value from 4 through
+67108864 and cannot raise the production limit. Invalid values fail clearly.
+`SPK_TEST_RESIDENCY_FAILURE=write/read` is only a fault-injection test hook.
 
-## Validation
+## Measured memory
 
-- `spk_vulkan_memory`: bounded pool reuse, live-buffer preservation across
-  frame cleanup, allocation reclaim/retry, refusal under a 64 MiB per-engine
-  ceiling, one-shot pressure reporting, and subsequent recovery. The same
-  test fails against the original backend on oversized reuse.
-- The existing Windows/Vulkan CTest suite covers transfers, kernels, geometry,
-  LUT/DI, feature boundaries, deterministic repeated rendering and C ABI result
-  ownership. These are local checks, not external Metal/Python film parity.
-- `python engine/tests/host_memory.py --host <exe> --resources <dir>`:
-  a synthetic image under a 128 MiB per-engine limit; preview works, full
-  render/export safely fail, no partial output is written, and the same session
-  and later exports remain usable without restarting the host.
-- Add `--full-size` for a separate 7168 x 10240 synthetic default-effects render
-  and TIFF16 export test with no artificial limit. Close other GPU applications
-  first. This checks allocation and resolution, not a private camera RAW.
+Local RTX 5070 Ti, 4688x7028 Sony ARW (32,947,264 pixels), 2560 preview, default
+Portra 400 / Portra Endura effects. Baseline is preserved build
+`build-widegamut-20261012`, commit `9c03b68`; candidate is the independent
+`build-memory-20261017`. Evidence is under the workspace's
+`validation/memory-optimization-20261017` and previous
+`validation/memory-profile-20261017` directories. The directory date records
+the experiment start; this follow-up completed on October 18.
 
-`SPEKTRAFILM_VULKAN_MEMORY_LIMIT_MB=<positive integer>` is an optional per-engine,
-per-device-local-heap ceiling for repeatable low-memory tests. It can only
-reduce the driver's budget. It is unset in the distributed runnable build.
+| Compatible16 measurement | Before | After |
+| --- | ---: | ---: |
+| Standalone RAW decoder peak process commit | 935.46 MB | 596.83 MB |
+| Host RAW open peak process commit | 1.303 GB | 0.974 GB |
+| Full-source preview peak process commit | 4.792 GB | 4.463 GB |
+| TIFF16 export peak process commit | 5.502 GB | 4.711 GB |
+| Private batch with an editor, peak process commit | 5.877 GB | 4.441 GB |
+| Last session closed, retained process commit | 4.023 GB | 0.519 GB |
+| Last session closed, unused device pool | 3.030 GB | 0 |
+| Maximum upload + readback staging | 593.05 MB | 134.22 MB |
 
-## Reproduce this build
+Headroom shows the same staging, pool and TIFF savings. Its standalone RAW
+peak remains 737.3 MB because that decode path still consumes the LibRaw
+buffer. Its private-batch peak changes from 5.964 to 4.435 GB. The editor in
+that batch test holds a 1.054 GB disk snapshot; the remaining device state is
+about 1 MB. No 80 MP IIQ sample was available: these results are not a
+reproduction or a guarantee for that format/camera.
 
-`build-tools.ps1` downloads checksum-verified portable GCC, CMake and glslang
-inside `build/deps`, plus the repository's pinned Vulkan headers and LibRaw.
-It changes no system installations. Configure the root CMake project with
-`BUILD_TESTING=ON`, `SPEKTRALAB_BUILD_NATIVE_RAW=ON`,
-`SPEKTRALAB_BUILD_HOST=ON`, `SPEKTRALAB_BUILD_DESKTOP=OFF`, and
-`SPEKTRALAB_STATIC_RUNTIME=ON`; provide absolute paths for
-`SPEKTRALAB_VULKAN_HEADERS`, `SPEKTRALAB_LIBRAW_SOURCE`, and
-`SPEKTRALAB_GLSLANG`. Build with MinGW Makefiles, then run CTest.
-The initial portable package kept the installed 1.3.1 frontend and replaced its
-engine host/resources. The second revision also rebuilds the frontend:
+MB/GB above are decimal. Process commit includes driver-backed commitments;
+it is not physical RAM. GPU buffer ledger, process commit, working set and
+board-wide GPU usage must not be added together. Sampling was 10 ms for the
+process and 100 ms for board-wide GPU usage, so very short peaks may be missed.
+Memory-workflow transfer diagnostics were enabled; its timings are not used
+as the speed benchmark. WebView/frontend memory is outside this measurement.
 
-- An image with identity geometry and neutral/disabled Layer 2 is exported by
-  the host directly, avoiding a full-resolution RGBA16 webview round trip.
-- Edited exports use the same `filePixels` arithmetic in a module worker.
-  Input and output ArrayBuffers are transferred, rather than cloned; a failed
-  worker returns a visible error instead of falling back to the UI thread.
-- The canvas opts into WebGL context restoration, reconstructs its renderer
-  and reuploads the retained frame. Texture-upload errors produce a message.
+## Speed tradeoffs
 
-The 7168 x 10240 synthetic default-effects engine render and TIFF16 export
-passed on the RTX 5070. A real Chromium worker processed the same pixel count
-with rotation and grading in about 10 seconds while a 20 ms UI timer kept
-ticking (largest measured gap about 21 ms). A separate browser test loses and
-restores the WebGL context and checks that the picture returns. These are
-synthetic checks; the reported private-photo black screen has not itself been
-reproduced from a captured crash log. On the final native build the user's
-7168 x 10240 photo was loaded, and the export page was observed reporting
-`written 1 / 1` while the image and interface remained visible.
+A separate diagnostic-free run alternated three independent processes of
+each build. Each kept default effects and the same input/snapshots, rendered
+the full print first, then recorded one initial and five hot exports per
+format. Complete calls include pixel readback, encoding, file closure and
+atomic rename; they do not force OS disk-cache flush to physical media and do
+not measure the WebView. `timing.json` and `timing-summary.json` retain all
+stage timings, samples and ranges.
 
-For the second revision, `setup-desktop-tools.ps1` prepares a local Rust GNU
-toolchain and frontend dependencies (pnpm must be on PATH, or pass
-`-PnpmExecutable`). Build the Vite production assets, then run
-`cargo build --manifest-path desktop/src-tauri/Cargo.toml --release --locked
---features tauri/custom-protocol` with the script's CARGO_HOME/RUSTUP_HOME and
-MinGW on PATH. Use a CARGO_TARGET_DIR without spaces: GNU windres otherwise
-misquotes its preprocessor include path. The setup script provides the legacy
-`libgcc_eh.a` name from GCC 16's combined static libgcc, which already exports
-the SEH unwinder. Ship x64 `WebView2Loader.dll` from the locked webview2-com-sys
-package beside the frontend executable. The complete package is checked with
-the development server stopped; it embeds the production assets.
+| Complete host call | Before median | After median (range) |
+| --- | ---: | ---: |
+| RAW + source open, first/process | 1942 ms | 2005 ms (1803–2138) |
+| First full-source 2560 view | 1078 ms | 1103 ms (1014–1155) |
+| JPEG Q92 hot export | 177 ms | 163 ms (157–289) |
+| PNG hot export | 1835 ms | 1961 ms (1754–2167) |
+| TIFF16 hot export | 228 ms | 98 ms (92–116) |
+| First private batch with editor | 2117 ms | 2691 ms (2627–2793) |
+| Returning to the suspended editor | 8 ms | 324 ms (300–336) |
 
-## Third revision: Sony ILCE-7RM6 active image area
+TIFF improves by 57%. PNG's hot median is 6.8% slower in this run, with
+overlapping ranges; this change does not claim universal speed improvement.
+The memory reduction is the purpose of chunked transfer and residency.
+The approximately 0.57 s first-batch cost saves the editor's exact cache once;
+subsequent private exports reuse that file. Restoring costs about 0.32 s when
+editing resumes. The 20-export integration test checks that the snapshot is
+not rewritten between batch frames. No parallel batch pipeline was enabled.
 
-The tested ARW exposes a 10240 x 7168 storage plane through LibRaw 0.22.2,
-with no active-area margins. That LibRaw release does not list ILCE-7RM6 in
-its model table, but does parse an explicit inset crop: left 12, top 8,
-width 9984, height 6656. Without applying it, the oriented decoded frame
-contains zero-valued padded rows/columns; the film transforms make them
-visible as near-black top/right bands in the export.
+## Regression coverage
 
-`io/raw_active_area.hpp` selects that metadata crop only for Sony ILCE-7RM6
-when LibRaw still exposes the complete, unmargined storage plane. It checks
-the crop's dimensions, bounds and unset-origin sentinels. Existing camera
-policies and already cropped frames are left alone. The RAW decoder sets
-LibRaw's cropbox before interpolation/orientation in both decode modes, and
-the host's probe uses the same policy so probe/open/export dimensions agree.
-No brightness threshold, film profile adjustment or image downsampling is
-used to choose the crop.
+`spk_vulkan_transfer` covers chunk boundaries, offset reads, unaligned host
+destinations, invalid ranges, double-to-float upload, clear/copy and trimming
+while live buffers remain valid. `spk_vulkan_view` covers exact random cached
+pixels across suspension, alias accounting, RNG continuation, mid-write and
+partial-read failure rollback, missing temporary directory and file cleanup.
+`spk_host_codecs` checks independently parsed TIFF pixels/metadata, 8/16-bit,
+odd dimensions, multiple strips and atomic write failure. The preserved old
+TIFF encoder also matched the new memory/file encoders in 12 complete-file
+byte comparisons using the same ICC input.
 
-The user's ARW was inspected read-only. Validation exports used an isolated
-copy under build/, with no sidecar writes to the original. Probe, open and
-JPEG export all reported 6656 x 9984 after rotation, and the exported image
-had no near-black full-width/full-height edge runs (before correction:
-about 216 rows at the top and 488 columns at the right). All 18 CTests passed,
-including a new policy test for model isolation, already cropped frames,
-unset origins and out-of-bounds metadata. This is a compatibility crop fix,
-not a claim of complete color/decode validation for every ARW 6.0 variant.
+`python engine/tests/host_memory.py --host <host> --resources <engine>` runs
+the real framed protocol with owned synthetic images: idle trim while polling,
+20 private exports, cache-file reuse despite metadata/progress polling,
+exact restore without the source file, failed redecode while suspended,
+queued/running cancellation, output failure/protection and close cleanup.
 
-Sony's documented 3:2 full-frame image size is 9984 x 6656:
-https://www.sony.com/electronics/support/e-mount-body-ilce-7-series/ilce-7rm6/specifications
+The standalone production RAW decoder was compared with the old source:
+both compatible16 and headroom full float RGB hashes are identical. Missing
+input and unsupported Nikon HE still return errors. External Metal/reference
+parity, Intel integrated GPUs and the reported IIQ file remain untested here.
+
+All 25 CTest checks pass in the configured MinGW toolchain environment. The
+full-size deterministic host comparison also has exact RGBA16 (263,578,112
+bytes), PNG and JPEG results, and exact TIFF8/TIFF16 files after masking only
+the generated ICC creation-date bytes. It disables random stages solely for
+cross-build pixel comparison; the timing and same-session residency tests
+keep default random effects. This is regression against the preserved Windows
+build, not a substitute for the external Metal/Python color oracle.
+
+The final staged host also passed the existing full-RAW regression adapted to
+the new disk-residency ledger, including Chinese paths, all three file formats,
+decode snapshots, cancellation, overwrite protection and 20 private ARW
+exports. Process commit over the last ten iterations stayed between 3.426 and
+3.430 GB; no retained-session or GPU-accounting growth was observed. Final
+host/resource hashes and test records are in `manifest.json`. The unchanged
+frontend was reused for the local `app/spektralab.exe` test directory; this run
+did not repeat a native-window interaction test. No Git commit or portable ZIP
+was created.

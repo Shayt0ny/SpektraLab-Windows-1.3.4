@@ -4,13 +4,15 @@
 // for ⌘). Single-key shortcuts are named in the label only — see keys.ts for
 // why they must not be accelerators (trap 32).
 
+import { webviewOwnsMenuKeys } from './keys';
 import { Menu, MenuItem, PredefinedMenuItem, Submenu } from '@tauri-apps/api/menu';
 import { t, tz } from '../i18n';
-import { openDialog, openExport, openFilesDialog, restartHost, revealSettings } from './actions';
+import { openDialog, openFolderDialog, openExport, restartHost, revealSettings } from './actions';
 import {
+  setAdjustments,
+  makePair,
   copySettings,
   currentFitZoom,
-  makePair,
   pasteSettings,
   redo,
   resetAdjustments,
@@ -38,6 +40,7 @@ export const MENU_CHORDS = new Set([
   'ctrl+o',
   'ctrl+shift+o',
   'ctrl+e',
+  'ctrl+j',
   'ctrl+z',
   'ctrl+shift+z',
   'ctrl+shift+c',
@@ -54,17 +57,25 @@ export const MENU_CHORDS = new Set([
   'ctrl+alt+]',
   'ctrl+,',
   'ctrl+q',
+  'f11',
 ]);
 
-const item = (text: string, action: () => void, accelerator?: string) => MenuItem.new({ text, action: () => action(), accelerator });
+const item = (text: string, action: () => void, accelerator?: string) => {
+  const webKeys = webviewOwnsMenuKeys();
+  return MenuItem.new({
+    text: webKeys && accelerator ? `${text}\t${accelerator.replace('CmdOrCtrl', 'Ctrl')}` : text,
+    action: () => { if (!sessionStore.getState().batchExporting) action(); },
+    accelerator: webKeys ? undefined : accelerator,
+  });
+};
 const sep = () => PredefinedMenuItem.new({ item: 'Separator' });
 
 export async function installMenu(): Promise<void> {
   const file = await Submenu.new({
     text: tz('&File', '文件(&F)'),
     items: [
-      await item(tz('Open Folder…', '打开文件夹…'), () => void openDialog(), 'CmdOrCtrl+O'),
-      await item(tz('Open Photographs…', '打开照片…'), () => void openFilesDialog(), 'CmdOrCtrl+Shift+O'),
+      await item(tz('Import Photographs…', '选择照片导入…'), () => void openDialog(), 'CmdOrCtrl+O'),
+      await item(tz('Open Folder…', '打开整个文件夹…'), () => void openFolderDialog(), 'CmdOrCtrl+Shift+O'),
       await item(tz('Export…', '导出…'), openExport, 'CmdOrCtrl+E'),
       await sep(),
       await item(tz('Settings…', '设置…'), () => setPages({ settingsOpen: true }), 'CmdOrCtrl+,'),
@@ -83,8 +94,6 @@ export async function installMenu(): Promise<void> {
       await sep(),
       await item(tz('Select All Photos', '选择全部照片'), selectAllFrames, 'CmdOrCtrl+A'),
       await item(tz('Sync Settings', '同步设置'), () => void syncSettings()),
-      await sep(),
-      await item(tz('Make Half-Frame Pair', '组成半格配对'), () => void makePair(), 'CmdOrCtrl+J'),
     ],
   });
   const view = await Submenu.new({
@@ -111,8 +120,7 @@ export async function installMenu(): Promise<void> {
       await item(
         tz('Bypass / Restore Adjustments', '停用 / 恢复调整'),
         () => {
-          const s = sessionStore.getState();
-          sessionStore.setState({ sidecar: { ...s.sidecar, adjustments: { ...s.sidecar.adjustments, enabled: !s.sidecar.adjustments.enabled } } });
+          setAdjustments((a) => ({ ...a, enabled: !a.enabled }));
         },
         'CmdOrCtrl+Shift+B',
       ),
@@ -126,6 +134,7 @@ export async function installMenu(): Promise<void> {
     items: [
       await item(tz('Previous  (←)', '上一张  (←)'), () => selectRelative(-1)),
       await item(tz('Next  (→)', '下一张  (→)'), () => selectRelative(1)),
+      await item(tz('New Photo Pair (Half Frame)', '新建双图拼接（半格）'), () => void makePair(), 'CmdOrCtrl+J'),
       await sep(),
       await item(tz('Reset Film, Paper, Camera and Enlarger', '重置胶片、相纸、相机与放大机'), resetParams),
       await item(tz('Reset Adjustments', '重置调整'), resetAdjustments),

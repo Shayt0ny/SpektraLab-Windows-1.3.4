@@ -26,7 +26,7 @@ try:
         image.save(source)
         o, _ = call('open', {'path': str(source)})
         sid = o['session']
-        r, px = call('render', {'session': sid, 'tier': 'full', 'format': 'rgba8', 'display': 'srgb', 'no_film': True})
+        r, px = call('render_view', {'session': sid, 'tier': 'full', 'format': 'rgba8', 'display': 'srgb', 'no_film': True})
         actual = [tuple(px[i*4:i*4+3]) for i in range(len(levels))]
         print('source gray:', levels)
         print('output RGB:', actual)
@@ -34,7 +34,7 @@ try:
         # Exercise destination switches and cached transforms, not just a first call.
         for space in ['srgb', 'display-p3', 'prophoto', 'srgb']:
             target = Path(tmp) / (space + '.png')
-            call('export_image', {'session': sid, 'path': str(target), 'format': 'png', 'color_space': space, 'overwrite': True, 'no_film': True})
+            call('export_frame', {'session': sid, 'source_path': str(source), 'path': str(target), 'format': 'png', 'color_space': space, 'overwrite': True, 'no_film': True})
             with Image.open(target) as result:
                 assert result.info.get('icc_profile'), 'missing output ICC profile'
                 if space == 'srgb': assert result.convert('RGBA').tobytes() == px, 'preview/export disagree'

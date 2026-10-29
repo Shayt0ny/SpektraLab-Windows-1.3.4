@@ -8,7 +8,7 @@
 // while dragging; `onCommit` on release.
 
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
-import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { Fragment, type ReactNode, useEffect, useRef, useState } from 'react';
 import { clamp } from '@shared/params';
 import { settingsStore, useSettings } from '../state/settings';
 import { beginGesture } from '../state/session';
@@ -24,7 +24,7 @@ export interface SectionProps {
   onReset?: () => void;
   resetHelp?: string;
   resetEnabled?: boolean;
-  menu?: { label: string; onSelect: () => void; disabled?: boolean; checked?: boolean }[];
+  menu?: { label: string; onSelect: () => void; disabled?: boolean; checked?: boolean; /** A rule above the item. */ divider?: boolean; testId?: string }[];
   /** A feature the host cannot do: shown, greyed, with the reason. */
   unsupported?: string | null;
 }
@@ -56,10 +56,13 @@ export function Section({ id, title, children, trailing, onReset, resetHelp, res
             <DropdownMenu.Portal>
               <DropdownMenu.Content className="menu" align="end" sideOffset={4}>
                 {menu.map((m) => (
-                  <DropdownMenu.Item key={m.label} className="menu-item" disabled={m.disabled} onSelect={m.onSelect}>
-                    {m.checked !== undefined && <span className="check">{m.checked ? '✓' : ''}</span>}
-                    {m.label}
-                  </DropdownMenu.Item>
+                  <Fragment key={m.label}>
+                    {m.divider && <DropdownMenu.Separator className="menu-sep" />}
+                    <DropdownMenu.Item className="menu-item" disabled={m.disabled} onSelect={m.onSelect} data-testid={m.testId}>
+                      {m.checked !== undefined && <span className="check">{m.checked ? '✓' : ''}</span>}
+                      {m.label}
+                    </DropdownMenu.Item>
+                  </Fragment>
                 ))}
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
@@ -92,7 +95,8 @@ export interface ScrubSliderProps {
   disabled?: boolean;
   reason?: string;
   blocked?: [number, number] | null;
-  usable?: [number, number] | null;
+  /** The fit's admissible windows. Rendering only; the owner commits/clamps. */
+  usable?: [number, number][];
   /** A coloured track (temperature, tint, the filter axes). */
   gradient?: string;
   testId?: string;
@@ -102,7 +106,9 @@ export function ScrubSlider(p: ScrubSliderProps) {
   const { label, sublabel, value, range, zero = 0, snap, format = (v) => v.toFixed(2), onChange, onCommit, disabled, reason, blocked, gradient } = p;
   const track = useRef<HTMLDivElement>(null);
   const [text, setText] = useState<string | null>(null);
+  const cancelText = useRef(false);
   const drag = useRef<{ x: number; v: number; w: number } | null>(null);
+  useEffect(() => { if (disabled) setText(null); }, [disabled]);
   const [lo, hi] = range;
   const frac = (v: number) => (clamp(v, lo, hi) - lo) / (hi - lo || 1);
 
@@ -136,8 +142,11 @@ export function ScrubSlider(p: ScrubSliderProps) {
   };
 
   const commitText = () => {
+    // Escape blurs synchronously, before React applies the draft reset.
+    if (cancelText.current) { cancelText.current = false; return; }
+    if (disabled) { setText(null); return; }
     if (text == null) return;
-    const n = p.parse ? p.parse(text) : Number.parseFloat(text.replace(',', '.').replace(/[^0-9.+-eE]/g, ''));
+    const n = (p.parse ?? parseSigned)(text);
     setText(null);
     if (n != null && Number.isFinite(n)) {
       beginGesture();
@@ -170,10 +179,11 @@ export function ScrubSlider(p: ScrubSliderProps) {
         aria-valuemin={lo}
         aria-valuemax={hi}
         aria-valuenow={value}
+        aria-disabled={disabled || undefined}
       >
         <div className="track" style={gradient ? { background: gradient, height: 2 } : undefined} />
         {blocked && <div className="blocked" style={{ left: `${frac(blocked[0]) * 100}%`, width: `${(frac(blocked[1]) - frac(blocked[0])) * 100}%` }} />}
-        {p.usable && <div className="placement-usable" style={{ left: `${frac(p.usable[0]) * 100}%`, width: `${(frac(p.usable[1]) - frac(p.usable[0])) * 100}%` }} />}
+        {p.usable?.map(([from, to], i) => <div key={i} className="usable" style={{ left: `${frac(from) * 100}%`, width: `${(frac(to) - frac(from)) * 100}%` }} />)}
         {zero > lo && zero < hi && <div className="zero" style={{ left: `${frac(zero) * 100}%` }} />}
         <div className="knob" style={{ left: `${frac(value) * 100}%` }} />
       </div>
@@ -182,14 +192,17 @@ export function ScrubSlider(p: ScrubSliderProps) {
         value={text ?? format(value)}
         disabled={disabled}
         onFocus={(e) => {
+          cancelText.current = false;
           setText(format(value));
           e.currentTarget.select();
         }}
         onChange={(e) => setText(e.target.value)}
         onBlur={commitText}
         onKeyDown={(e) => {
+          if (disabled) return;
           if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
           if (e.key === 'Escape') {
+            cancelText.current = true;
             setText(null);
             (e.target as HTMLInputElement).blur();
           }
@@ -199,7 +212,7 @@ export function ScrubSlider(p: ScrubSliderProps) {
             beginGesture();
             const v = clamp(value + (e.key === 'ArrowUp' ? step : -step), lo, hi);
             onChange(v);
-            setText(format(v));
+            setText(null); // the owner may clamp to a solved admissible window
           }
         }}
         aria-label={label + ' value'}
@@ -210,7 +223,9 @@ export function ScrubSlider(p: ScrubSliderProps) {
 
 export const signed = (digits: number) => (v: number) => (v > 0 ? '+' : v < 0 ? '−' : '') + Math.abs(v).toFixed(digits);
 export const parseSigned = (s: string) => {
-  const n = Number.parseFloat(s.replace('−', '-').replace(',', '.'));
+  // Match signed()'s typographic minus before parsing; parseFloat accepts the
+  // unit suffix used by angle and percentage controls without losing the sign.
+  const n = Number.parseFloat(s.replaceAll('−', '-').replace(',', '.'));
   return Number.isFinite(n) ? n : null;
 };
 
@@ -224,6 +239,7 @@ export function ToggleRow(p: { label: string; sublabel?: string; on: boolean; on
       onClick={() => !p.disabled && p.onChange(!p.on)}
       role="switch"
       aria-checked={p.on}
+      aria-disabled={p.disabled || undefined}
       aria-label={p.label}
       data-testid={p.testId}
     >
@@ -308,45 +324,12 @@ export function PillMenu<T extends string | number>(p: {
   );
 }
 
-// ------------------------------------------------------------------ TextRow
-
-/** A labelled text field that commits on Enter or blur (the edge print, the date). */
-export function TextRow(p: { label: string; value: string; placeholder?: string; onCommit: (v: string) => void; disabled?: boolean; maxLength?: number; testId?: string }) {
-  const [text, setText] = useState<string | null>(null);
-  useEffect(() => setText(null), [p.value]);
-  return (
-    <div className={'row' + (p.disabled ? ' disabled' : '')}>
-      <span className="row-label">{p.label}</span>
-      <input
-        className="unit-field text-field"
-        value={text ?? p.value}
-        placeholder={p.placeholder}
-        disabled={p.disabled}
-        maxLength={p.maxLength}
-        aria-label={p.label}
-        data-testid={p.testId}
-        onChange={(e) => setText(e.target.value)}
-        onBlur={() => {
-          if (text != null && text !== p.value) p.onCommit(text);
-          setText(null);
-        }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-          if (e.key === 'Escape') {
-            setText(null);
-            (e.target as HTMLInputElement).blur();
-          }
-        }}
-      />
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------- UnitField
 
 export function NumberField(p: { value: number; decimals: number; onCommit: (v: number) => void; disabled?: boolean; width?: number; label?: string }) {
   const [text, setText] = useState<string | null>(null);
-  useEffect(() => setText(null), [p.value]);
+  const cancelText = useRef(false);
+  useEffect(() => setText(null), [p.value, p.disabled]);
   return (
     <input
       className="unit-field"
@@ -354,17 +337,22 @@ export function NumberField(p: { value: number; decimals: number; onCommit: (v: 
       value={text ?? p.value.toFixed(p.decimals)}
       disabled={p.disabled}
       aria-label={p.label}
+      onFocus={() => { cancelText.current = false; }}
       onChange={(e) => setText(e.target.value)}
       onBlur={() => {
+        if (cancelText.current) { cancelText.current = false; return; }
+        if (p.disabled) { setText(null); return; }
         if (text != null) {
-          const n = Number.parseFloat(text.replace(',', '.'));
-          if (Number.isFinite(n)) p.onCommit(n);
+          const n = parseSigned(text);
+          if (n != null) p.onCommit(n);
           setText(null);
         }
       }}
       onKeyDown={(e) => {
+        if (p.disabled) return;
         if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
         if (e.key === 'Escape') {
+          cancelText.current = true;
           setText(null);
           (e.target as HTMLInputElement).blur();
         }

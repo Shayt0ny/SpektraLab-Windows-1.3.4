@@ -880,17 +880,6 @@
   ]
  },
  {
-  "name": "preview_long_edge",
-  "path": "io.preview_long_edge",
-  "type": "int",
-  "layer": "print",
-  "live": false,
-  "range": [
-   800.0,
-   8192.0
-  ]
- },
- {
   "name": "camera_filter",
   "path": "camera.filter",
   "type": "str",
@@ -904,8 +893,19 @@
   "layer": "shoot",
   "live": false,
   "range": [
-   0,
-   8
+   0.0,
+   8.0
+  ]
+ },
+ {
+  "name": "preview_long_edge",
+  "path": "io.preview_long_edge",
+  "type": "int",
+  "layer": "print",
+  "live": false,
+  "range": [
+   800.0,
+   8192.0
   ]
  }
 ]

@@ -1,53 +1,91 @@
 import { describe, expect, it } from 'vitest';
-import { captureDay, dataTextFrom, dateBackCameraFor, edgeTextFor, formatDate, gaugeOf, resolvedFilmEdge } from './filmEdge';
-import { FILM_PARAMS_DEFAULT, gateRatio } from './params';
+import { ALL_FEATURES, FILM_PARAMS_DEFAULT, fullDelta } from './params';
+import { GEOMETRY_DEFAULT, outputSize } from './geometry';
+import { StockCatalog } from './stocks';
+import { captureDate, shootingText, edgeText, resolveFilmEdgeParams, canvasGeometryFor, sourceGeometryFor, gateFramed, datePrints, dateEffective, edgeEffective, geometryInNegative } from './filmEdge';
+import { decodeSidecar, encodeSidecar, newSidecar } from './sidecar';
+import stockData from '../../../modern_UI/Spektrafilm/Spektrafilm/Resources/StockCatalog.json';
+const catalog = new StockCatalog(stockData.stocks);
+const native = { width: 6000, height: 4000 };
+const crop = { ...GEOMETRY_DEFAULT, crop: { x: .1, y: .1, width: .6, height: .7 }, angle: 3, quarterTurns: 1, flipH: true };
 
-describe('film edge resolution (Session+FilmEdge.swift)', () => {
-  it('prints a stock its own edge text per gauge, else its name', () => {
-    expect(edgeTextFor('kodak_gold_200', 'Kodak Gold 200', '135')).toBe('KODAK GB 200-7');
-    expect(edgeTextFor('kodak_gold_200', 'Kodak Gold 200', '120')).toBe('KODAK 200');
-    expect(edgeTextFor('kodak_portra_400', 'Kodak Portra 400 (v2)', '135')).toBe('KODAK PORTRA 400');
-    expect(edgeTextFor('unknown', undefined, '135')).toBe('');
-    expect(gaugeOf('135_xpan')).toBe('135');
-    expect(gaugeOf('120_6x7')).toBe('120');
+describe('the camera gate and date back contract', () => {
+  it('bypasses the film edge and date back without losing normal crop, rotation or saved parameters', () => {
+    const p = structuredClone(FILM_PARAMS_DEFAULT);
+    p.filmEdge.active = true; p.dateBack.active = true;
+    const saved = structuredClone(p);
+    expect(edgeEffective(p.filmEdge, ALL_FEATURES, true)).toBe(false);
+    expect(dateEffective(p.dateBack, p.filmEdge, ALL_FEATURES, true)).toBe(false);
+    expect(geometryInNegative(p, ALL_FEATURES, true)).toBe(false);
+    expect(sourceGeometryFor(p, crop, ALL_FEATURES, true)).toBeNull();
+    expect(canvasGeometryFor(p, crop, ALL_FEATURES, true)).toBe(crop);
+    expect(sourceGeometryFor(p, crop, ALL_FEATURES, false)).toBe(crop);
+    expect(canvasGeometryFor(p, crop, ALL_FEATURES, false)).toEqual(GEOMETRY_DEFAULT);
+    expect(p).toEqual(saved);
   });
+  it('accepts host ISO and EXIF dates without inventing unavailable or invalid shooting data', () => {
+    expect(captureDate('2026-10-01T12:34:56', 'japan')).toBe("'26 10 1");
+    expect(captureDate('2026:10:01 12:34:56', 'us')).toBe("10 1 '26");
+    expect(captureDate('2026-02-29T12:00:00', 'japan')).toBe('');
+    expect(captureDate('2024-02-29', 'japan')).toBe("'24 2 29");
+    expect(shootingText(null)).toBe('');
+    expect(shootingText({ focal_mm: 50 })).toBe(''); // not equivalent focal length
+    expect(shootingText({ shutter_s: 1 / 250, aperture: 2.8, exposure_program: 3, exposure_bias_ev: .3, focal_35mm: 50 })).toBe('1/250 F2.8 A +0.3 50mm');
+  });
+  it('uses released silver-stock lettering and resolves metadata identically on repeated passes', () => {
+    expect(edgeText(catalog.stock('kodak_tri_x_400'), '135')).toBe('KODAK 400TX');
+    expect(edgeText(catalog.stock('fujifilm_neopan_acros_100_ii'), '120_6x6')).toBe('FUJI 100 ACROS II');
+    const p = { ...FILM_PARAMS_DEFAULT, filmStock: 'kodak_tri_x_400' };
+    const metadata = { datetime_original: '2026-10-01T12:00:00', aperture: 4 };
+    const resolved = resolveFilmEdgeParams(p, crop, metadata, catalog, native);
+    expect(resolveFilmEdgeParams(resolved, crop, metadata, catalog, native)).toEqual(resolved);
+    expect(resolved).toMatchObject({ filmEdge: { edgeText: 'KODAK 400TX', fNumber: 4 }, dateBack: { text: "'26 10 1", framing: expect.any(String) } });
+  });
+  it('holds a physical gate ratio, with post geometry identity and original crop retained in the sidecar', () => {
+    const p = { ...FILM_PARAMS_DEFAULT, filmEdge: { ...FILM_PARAMS_DEFAULT.filmEdge, active: true, format: '135_half' } };
+    const g = gateFramed(crop, p.filmEdge, native);
+    expect(g.crop.width * native.width / (g.crop.height * native.height)).toBeCloseTo(4 / 3, 8);
+    expect(sourceGeometryFor(p, g)).toBe(g);
+    expect(canvasGeometryFor(p, g)).toEqual(GEOMETRY_DEFAULT);
+    const sc = { ...newSidecar(), params: p, geometry: g, heldCrop: crop };
+    expect(decodeSidecar(encodeSidecar(sc))).toMatchObject({ geometry: g, heldCrop: crop });
+    expect(encodeSidecar({ ...sc, heldCrop: null })).not.toHaveProperty('heldCrop');
+    expect(sourceGeometryFor(p, g, { ...ALL_FEATURES, overscan: false })).toBeNull();
+  });
+  it('allows bare 135 dates, requires an edge for data/120, and refuses panoramic backs', () => {
+    const d = { ...FILM_PARAMS_DEFAULT.dateBack, active: true };
+    const e = FILM_PARAMS_DEFAULT.filmEdge;
+    expect(dateEffective(d, e)).toBe(true);
+    expect(datePrints('data', d, e)).toBe(false);
+    expect(dateEffective({ ...d, camera: '120_645' }, e)).toBe(false);
+    expect(dateEffective(d, { ...e, active: true, format: '120_645' })).toBe(true);
+    expect(dateEffective(d, { ...e, active: true, format: '135_xpan' })).toBe(false);
+    const p = { ...FILM_PARAMS_DEFAULT, dateBack: d };
+    expect(sourceGeometryFor(p, GEOMETRY_DEFAULT)).toBeNull();
+    expect(sourceGeometryFor(p, crop)).toBe(crop);
+  });
+  it('scales date-only physical pitch on the cut and emits real metadata, never a stale other-frame date', () => {
+    const p = { ...FILM_PARAMS_DEFAULT, filmFormatMM: 36, dateBack: { ...FILM_PARAMS_DEFAULT.dateBack, active: true, withData: true } };
+    const cut = { ...GEOMETRY_DEFAULT, crop: { x: .25, y: .25, width: .5, height: .5 } };
+    const resolved = resolveFilmEdgeParams(p, cut, { datetime_original: '2026-10-01T00:00:00' }, catalog, native);
+    expect(fullDelta(resolved)).toMatchObject({ date_imprint_active: true, date_imprint_text: "'26 10 1", date_imprint_data_text: '', film_format_mm: 18 });
+    expect(outputSize(cut, native)).toEqual({ width: 3000, height: 2000 });
+    expect(fullDelta(resolveFilmEdgeParams(resolved, cut, null, catalog, native))).toHaveProperty('date_imprint_text', '');
+  });
+});
 
-  it('formats the date as the faces print it', () => {
-    expect(formatDate(1998, 10, 28, 'japan')).toBe("'98 10 28");
-    expect(formatDate(2005, 3, 7, 'us')).toBe("3 7 '05");
-    expect(captureDay('2024:06:01 12:00:00')).toEqual({ year: 2024, month: 6, day: 1 });
-    expect(captureDay('2024-06-01T12:00:00')).toEqual({ year: 2024, month: 6, day: 1 });
-    expect(captureDay('0000:00:00 00:00:00')).toBeNull();
-    expect(captureDay(undefined)).toBeNull();
-  });
-
-  it('builds the data line from what the file carries, and never past 22 characters', () => {
-    expect(dataTextFrom({ shutter_s: 1 / 250, aperture: 5.6, focal_mm: 24 })).toBe('1/250 F5.6 24mm');
-    expect(dataTextFrom({ shutter_s: 2, aperture: 8 })).toBe('2s F8');
-    expect(dataTextFrom({})).toBe('');
-    expect(dataTextFrom({ shutter_s: 1 / 8000, aperture: 22, focal_mm: 1200 }).length).toBeLessThanOrEqual(22);
-  });
-
-  it('finds the date back camera from Film Format', () => {
-    expect(dateBackCameraFor(36, 24)).toBe('135');
-    expect(dateBackCameraFor(56, 41.5)).toBe('120_645');
-    expect(dateBackCameraFor(69.5, 56)).toBeNull();
-  });
-
-  it('resolves everything at once, and is idempotent', () => {
-    const p = { ...FILM_PARAMS_DEFAULT, filmStock: 'kodak_gold_200', dateBack: { ...FILM_PARAMS_DEFAULT.dateBack, active: true } };
-    const meta = { datetime_original: '1998:10:28 10:00:00', aperture: 2.8, shutter_s: 1 / 125 };
-    const r = resolvedFilmEdge(p, meta, 'Kodak Gold 200', 1.5);
-    expect(r.filmEdge.edgeText).toBe('KODAK GB 200-7');
-    expect(r.filmEdge.fNumber).toBe(2.8);
-    expect(r.dateBack.text).toBe("'98 10 28");
-    expect(r.dateBack.dataText).toBe('1/125 F2.8');
-    expect(resolvedFilmEdge(r, meta, 'Kodak Gold 200', 1.5)).toEqual(r);
-  });
-
-  it('gives the gate its orientation', () => {
-    expect(gateRatio('135', true)).toBeCloseTo(1.5);
-    expect(gateRatio('135', false)).toBeCloseTo(2 / 3);
-    expect(gateRatio('120_6x7', true)).toBeCloseTo(69.5 / 56);
-  });
+// 1.3.4's 0f71c4c9: the date alone cuts the frame only once the crop is not the whole frame, so
+// the first ratio chosen in the crop tool turned framing on mid-session and the Mac's canvas
+// jumped under the crop. Here the canvas frames on `geometryInNegative`, which does not depend
+// on the crop: it shows the decode for the whole tool session, before and after that first ratio,
+// while the engine's cut (`sourceGeometryFor`) follows the crop.
+it('frames the decode for the whole crop session under the date alone, so the first ratio cannot jolt the canvas', () => {
+  const p = { ...FILM_PARAMS_DEFAULT, dateBack: { ...FILM_PARAMS_DEFAULT.dateBack, active: true, face: 'lcd', placement: 'frame' } };
+  expect(dateEffective(p.dateBack, p.filmEdge, ALL_FEATURES)).toBe(true);
+  const whole = GEOMETRY_DEFAULT;
+  const firstRatio = { ...GEOMETRY_DEFAULT, crop: { x: 0, y: 0.0833, width: 1, height: 0.8333 }, lockedRatio: 16 / 9 };
+  expect(sourceGeometryFor(p, whole, ALL_FEATURES)).toBeNull();
+  expect(sourceGeometryFor(p, firstRatio, ALL_FEATURES)).toEqual(firstRatio);
+  // The canvas's framing switch (Canvas.tsx: cropping && geometryInNegative) is the same on both sides.
+  expect(geometryInNegative(p, ALL_FEATURES)).toBe(true);
 });

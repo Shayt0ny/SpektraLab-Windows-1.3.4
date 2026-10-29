@@ -1,20 +1,78 @@
 #include "raw_decoder.hpp"
 #include "raw_headroom.hpp"
+#include "camera_libraw.hpp"
 #include "raw_active_area.hpp"
 
 #include <libraw/libraw.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <iterator>
 #include <memory>
+#include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace spk::io {
+
+#if SPEKTRALAB_RAW_OPENMP && !defined(LIBRAW_USE_OPENMP)
+#error "RAW OpenMP requested but LibRaw parallel processing is disabled"
+#endif
+
+bool raw_openmp_enabled() noexcept {
+#if SPEKTRALAB_RAW_OPENMP
+    return true;
+#else
+    return false;
+#endif
+}
+
+unsigned raw_worker_limit() {
+    const unsigned available = std::max(1u, std::thread::hardware_concurrency());
+    unsigned requested = std::min(8u, available);
+    if (const char* value = std::getenv("SPEKTRALAB_RAW_THREADS")) {
+        const char* end = value + std::strlen(value);
+        const auto parsed = std::from_chars(value, end, requested);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || requested == 0)
+            throw std::invalid_argument("SPEKTRALAB_RAW_THREADS must be a positive integer");
+    }
+    return raw_openmp_enabled() ? std::min(requested, available) : 1u;
+}
+
+RawDecodeThreadScope::RawDecodeThreadScope() : workers_(raw_worker_limit()) {
+#if SPEKTRALAB_RAW_OPENMP
+    previous_threads_ = omp_get_max_threads();
+    previous_dynamic_ = omp_get_dynamic();
+#if _OPENMP >= 200805
+    previous_levels_ = omp_get_max_active_levels();
+    omp_set_max_active_levels(1);
+#else
+    previous_levels_ = omp_get_nested();
+    omp_set_nested(0);
+#endif
+    omp_set_dynamic(0);
+    omp_set_num_threads(static_cast<int>(workers_));
+#endif
+}
+
+RawDecodeThreadScope::~RawDecodeThreadScope() {
+#if SPEKTRALAB_RAW_OPENMP
+    omp_set_num_threads(previous_threads_);
+#if _OPENMP >= 200805
+    omp_set_max_active_levels(previous_levels_);
+#else
+    omp_set_nested(previous_levels_);
+#endif
+    omp_set_dynamic(previous_dynamic_);
+#endif
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -42,19 +100,6 @@ bool supported_compression(LibRaw& raw, std::string& error) {
         return false;
     }
     return true;
-}
-
-void configure_active_area(LibRaw& raw) {
-    const auto& data = raw.imgdata;
-    const auto area = camera_active_area(data.idata.make, data.idata.model, data.sizes);
-    if (!area.corrected) return;
-    // LibRaw applies cropbox before interpolation and final orientation. Keep
-    // both the Bayer phase and its flip semantics in the decoder that owns them.
-    auto& crop = raw.imgdata.params.cropbox;
-    crop[0] = area.left;
-    crop[1] = area.top;
-    crop[2] = area.width;
-    crop[3] = area.height;
 }
 
 void configure_compatible(libraw_output_params_t& params) {
@@ -125,6 +170,10 @@ bool capture_source_metadata(const LibRaw& raw, RawMetadata& metadata,
         sizes.iwidth, sizes.iheight, sizes.top_margin, sizes.left_margin,
         sizes.pixel_aspect};
     metadata.raw_flip = sizes.flip;
+    metadata.colour_channels = data.idata.colors;
+    for (unsigned row = 0; row < 3; ++row)
+        for (unsigned col = 0; col < 3; ++col)
+            metadata.camera_from_xyz[row * 3 + col] = color.cam_xyz[row][col];
     metadata.as_shot_wb_applied = color.as_shot_wb_applied != 0;
     metadata.black = color.black;
     metadata.white_level = color.maximum;
@@ -179,9 +228,27 @@ bool supported_headroom_source(LibRaw& raw, std::string& error) {
     return true;
 }
 
-class HeadroomLibRaw final : public LibRaw {
+class CompatibleLibRaw final : public CameraLibRaw {
 public:
-    HeadroomLibRaw() : LibRaw(LIBRAW_OPTIONS_NO_DATAERR_CALLBACK) {}
+    CompatibleLibRaw() = default;
+    std::array<float, 12> matrix{};
+    bool calibrated = false;
+protected:
+    void convert_to_rgb_loop(float out_cam[3][4]) override {
+        calibrated = !libraw_internal_data.internal_output_params.raw_color && imgdata.idata.colors == 3 && imgdata.image;
+        if (!calibrated) return;
+        if (!libraw_internal_data.internal_output_params.raw_color && imgdata.idata.colors == 3)
+            for (unsigned row = 0; row < 3; ++row)
+                for (unsigned col = 0; col < 4; ++col)
+                    matrix[row * 4 + col] = out_cam[row][col];
+        // Observe the boundary without changing LibRaw's conversion or pixels.
+        LibRaw::convert_to_rgb_loop(out_cam);
+    }
+};
+
+class HeadroomLibRaw final : public CameraLibRaw {
+public:
+    HeadroomLibRaw() = default;
 
     std::vector<float> converted;
     std::uint32_t converted_width = 0, converted_height = 0;
@@ -231,12 +298,13 @@ bool decode_raw_compatible(const std::filesystem::path& source, const std::array
     error.clear();
     const auto total_start = Clock::now();
     try {
+        RawDecodeThreadScope thread_scope;
         if (source.empty()) {
             error = "RAW open: source path is empty";
             return false;
         }
         // LibRaw carries substantial metadata; keep it off the Windows stack.
-        auto raw = std::make_unique<LibRaw>(LIBRAW_OPTIONS_NO_DATAERR_CALLBACK);
+        auto raw = std::make_unique<CompatibleLibRaw>();
         configure_compatible(raw->imgdata.params);
         if (user_mul) {
             // A caller-chosen white balance (the host's Temperature/Tint):
@@ -252,6 +320,8 @@ bool decode_raw_compatible(const std::filesystem::path& source, const std::array
             raw->imgdata.params.use_camera_wb = 0;
         }
         DecodedRaw decoded;
+        decoded.timings.openmp_enabled = raw_openmp_enabled();
+        decoded.timings.workers = thread_scope.workers();
         auto start = Clock::now();
         // filesystem::path::value_type is wchar_t on Windows, selecting
         // LibRaw's Unicode filename overload without an ANSI conversion.
@@ -259,6 +329,11 @@ bool decode_raw_compatible(const std::filesystem::path& source, const std::array
         decoded.timings.open_ms = elapsed_ms(start);
         if (!libraw_ok(open_status, "RAW open", error)) return false;
         if (!supported_compression(*raw, error)) return false;
+        const auto area = camera_active_area(raw->imgdata.idata.make, raw->imgdata.idata.model, raw->imgdata.sizes);
+        if (area.corrected) {
+            auto& crop = raw->imgdata.params.cropbox;
+            crop[0] = area.left; crop[1] = area.top; crop[2] = area.width; crop[3] = area.height;
+        }
 
         start = Clock::now();
         const int unpack_status = raw->unpack();
@@ -271,12 +346,14 @@ bool decode_raw_compatible(const std::filesystem::path& source, const std::array
         if (!capture_source_metadata(*raw, decoded.metadata, error)) return false;
         if (const char* name = raw->unpack_function_name()) decoded.metadata.decoder_name = name;
 
-        configure_active_area(*raw);
-
         start = Clock::now();
         const int process_status = raw->dcraw_process();
         decoded.timings.process_ms = elapsed_ms(start);
         if (!libraw_ok(process_status, "RAW process", error)) return false;
+        if (!raw->calibrated) {
+            error = "RAW compatible16: no supported three-channel camera-to-ProPhoto transform";
+            return false;
+        }
         if (raw->error_count() != 0) {
             error = "RAW process: decoder reported corrupt data";
             return false;
@@ -300,6 +377,7 @@ bool decode_raw_compatible(const std::filesystem::path& source, const std::array
                 decoded.metadata.rgb_cam[row * 4 + col] = color.rgb_cam[row][col];
         decoded.metadata.postprocess_black = color.black;
         decoded.metadata.postprocess_maximum = color.maximum;
+        decoded.metadata.camera_to_output = raw->matrix;
 
         // This also performs LibRaw's final orientation and identity gamma
         // lookup. Reading imgdata.image directly would omit those semantics.
@@ -322,6 +400,11 @@ bool decode_raw_compatible(const std::filesystem::path& source, const std::array
         }
         decoded.width = image->width;
         decoded.height = image->height;
+        // The oriented RGB16 output owns its allocation independently of
+        // LibRaw, and all source metadata has been captured above. Release
+        // LibRaw's sensor and four-channel image before allocating float RGB
+        // so those full-size buffers do not overlap unnecessarily.
+        raw.reset();
         decoded.rgb.resize(static_cast<std::size_t>(samples));
         for (std::size_t i = 0; i < decoded.rgb.size(); ++i) {
             std::uint16_t value;
@@ -345,24 +428,47 @@ bool decode_raw_compatible(const std::filesystem::path& source, const std::array
 
 bool decode_raw_headroom(const std::filesystem::path& source,
                          DecodedRaw& out, std::string& error) {
+    return decode_raw_headroom(source, nullptr, out, error);
+}
+
+bool decode_raw_headroom(const std::filesystem::path& source, const std::array<float, 4>* user_mul,
+                         DecodedRaw& out, std::string& error) {
     error.clear();
     const auto total_start = Clock::now();
     try {
+        RawDecodeThreadScope thread_scope;
         if (source.empty()) {
             error = "RAW open: source path is empty";
             return false;
         }
         auto raw = std::make_unique<HeadroomLibRaw>();
         configure_compatible(raw->imgdata.params);
+        if (user_mul) {
+            for (unsigned c = 0; c < 4; ++c) {
+                if (!std::isfinite((*user_mul)[c]) || (*user_mul)[c] <= 0.0f) {
+                    error = "RAW process: invalid user white-balance multiplier";
+                    return false;
+                }
+                raw->imgdata.params.user_mul[c] = (*user_mul)[c];
+            }
+            raw->imgdata.params.use_camera_wb = 0;
+        }
         // LibRaw's Ignore mode prevents WB multipliers above one, but does not
         // reconstruct sensor saturation and still uses uint16 intermediates.
         raw->imgdata.params.highlight = 1;
         DecodedRaw decoded;
+        decoded.timings.openmp_enabled = raw_openmp_enabled();
+        decoded.timings.workers = thread_scope.workers();
         auto start = Clock::now();
         const int open_status = raw->open_file(source.c_str());
         decoded.timings.open_ms = elapsed_ms(start);
         if (!libraw_ok(open_status, "RAW open", error)) return false;
         if (!supported_compression(*raw, error)) return false;
+        const auto area = camera_active_area(raw->imgdata.idata.make, raw->imgdata.idata.model, raw->imgdata.sizes);
+        if (area.corrected) {
+            auto& crop = raw->imgdata.params.cropbox;
+            crop[0] = area.left; crop[1] = area.top; crop[2] = area.width; crop[3] = area.height;
+        }
 
         start = Clock::now();
         const int unpack_status = raw->unpack();
@@ -376,8 +482,6 @@ bool decode_raw_headroom(const std::filesystem::path& source,
             !supported_headroom_source(*raw, error)) return false;
         if (const char* name = raw->unpack_function_name()) decoded.metadata.decoder_name = name;
 
-        configure_active_area(*raw);
-
         start = Clock::now();
         const int process_status = raw->dcraw_process();
         const double process_and_conversion_ms = elapsed_ms(start);
@@ -389,7 +493,7 @@ bool decode_raw_headroom(const std::filesystem::path& source,
             return false;
         }
         decoded.metadata.process_warnings = raw->imgdata.process_warnings;
-        if (decoded.metadata.process_warnings & LIBRAW_WARN_BAD_CAMERA_WB) {
+        if (!user_mul && (decoded.metadata.process_warnings & LIBRAW_WARN_BAD_CAMERA_WB)) {
             error = "RAW process: LibRaw rejected camera/as-shot white balance";
             return false;
         }

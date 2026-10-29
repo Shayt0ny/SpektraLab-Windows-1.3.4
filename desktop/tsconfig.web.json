@@ -17,7 +17,6 @@
     "mock-host/core.ts"
   ],
   "exclude": [
-    "src/**/realhost.test.ts",
-    "src/**/realhost.*.test.ts"
+    "src/**/realhost.test.ts"
   ]
 }
