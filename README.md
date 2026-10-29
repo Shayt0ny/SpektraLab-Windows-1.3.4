@@ -3,7 +3,6 @@
 胶片模拟软件 SpektraLab 的 **Windows 移植版**。原版只有 macOS，这里把它搬到了 Windows 上：打开 RAW 照片，选好胶片和相纸，就能得到按真实冲印过程模拟的效果。
 
 本分支由 **[shayt0ny](https://github.com/Shayt0ny)** 继续维护，Windows 移植基础来自
-**[NANATATA](https://github.com/YZH2006517/SpektraLab-Windows-NANATATA)**，
 原始项目为 **[JamesQiu2005/SpektraLab](https://github.com/JamesQiu2005/SpektraLab)**。
 1.3.4 的升级内容、颜色修复、显存保护和验证范围见
 [发布说明](RELEASE_NOTES_1.3.4_zh-CN.md)。
