@@ -1,0 +1,35 @@
+{
+  "product": "SpektraLab",
+  "version": "1.3.4",
+  "platform": "Windows x64",
+  "maintainer": "shayt0ny",
+  "upstream": {
+    "url": "https://github.com/JamesQiu2005/SpektraLab",
+    "version": "1.3.4",
+    "commit": "fd891c6bc5eb350387602deb5c1ef9b6dcdab948"
+  },
+  "windows_base": {
+    "url": "https://github.com/YZH2006517/SpektraLab-Windows-NANATATA",
+    "credit": "NANATATA",
+    "commit": "d667dcf7173f8c582060c43fe222da59f0f68a75"
+  },
+  "source_state": "Windows maintenance changes are included in this source archive; base commit alone does not reproduce the release.",
+  "validation": {
+    "frontend_and_real_host_tests_passed": 84,
+    "engine_ctests_passed": 18,
+    "native_colour_browser_tests_passed": 2,
+    "additional_checks": [
+      "73 MP worker responsiveness",
+      "WebGL context recovery",
+      "73 MP full render and TIFF16 export",
+      "low VRAM refusal and recovery",
+      "source bypass and destination colour regressions",
+      "native version 1.3.4 and actual full-resolution display"
+    ]
+  },
+  "release_executables_sha256": {
+    "spektralab.exe": "0369d78748f8ef987f8b9d439c7856a999da25651bb725dfe370a1249726e338",
+    "spektralab-host.exe": "0dd76ad10ad28cc83aecd9d0a66c256a8c1c114ebdd16804a32f5791d79fa1e3",
+    "WebView2Loader.dll": "86545b66cdb0603bc26b626fb9ad610cb6e71f28d468f5ea66df23b03dda96d5"
+  }
+}
