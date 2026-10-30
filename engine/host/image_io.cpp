@@ -21,6 +21,17 @@
 #include "stb_image.h"
 #include "tiff_ifd.hpp"
 #include "white_balance.hpp"
+#include "raw_candidate_api.hpp"
+#if !defined(SPEKTRALAB_RAW_CANDIDATE_MODULE)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+#endif
 
 namespace spkhost {
 
@@ -778,7 +789,7 @@ static void oriented_size(uint32_t& w, uint32_t& h, int orientation) {
     if (orientation >= 5) std::swap(w, h);
 }
 
-bool probe_file(const fs::path& path, Probe& out, std::string& error) {
+bool probe_file_impl(const fs::path& path, Probe& out, std::string& error) {
     out = Probe{};
     std::error_code ec;
     if (!fs::is_regular_file(path, ec)) { error = "not found: " + path_utf8(path); return false; }
@@ -805,9 +816,9 @@ bool probe_file(const fs::path& path, Probe& out, std::string& error) {
     return true;
 }
 
-bool decode_linear_prophoto(const fs::path& path, const DecodeOptions& options, FloatImage& out,
+bool decode_linear_prophoto_impl(const fs::path& path, const DecodeOptions& options, FloatImage& out,
                             Probe& probe, std::string& error) {
-    if (!probe_file(path, probe, error)) return false;
+    if (!probe_file_impl(path, probe, error)) return false;
     const bool custom_wb = options.temperature_k.has_value();
     if (custom_wb && probe.kind != FileKind::Raw) {
         error = std::string(kUnsupportedPrefix) + "white balance at decode applies to RAW files only";
@@ -838,7 +849,7 @@ bool decode_linear_prophoto(const fs::path& path, const DecodeOptions& options, 
         out.rgb = std::move(decoded.rgb);   // LibRaw already applied the flip
         out.raw_timings = decoded.timings;
         out.raw_metadata = std::move(decoded.metadata);
-        if(options.lens_correction && !correct_lens(out,probe,error))return false;
+        if(options.lens_correction && !correct_lens(out,probe,error,options.lens_profile))return false;
         return true;
     }
     Raster r;
@@ -899,13 +910,13 @@ static void shrink_rgb(std::vector<float>& rgb, uint32_t& w, uint32_t& h, uint32
     w = dw; h = dh;
 }
 
-bool thumbnail(const fs::path& path, uint32_t long_edge, Rgba8& out, std::string& source, std::string& error, bool embedded_only) {
+bool thumbnail_impl(const fs::path& path, uint32_t long_edge, Rgba8& out, std::string& source, std::string& error, bool embedded_only) {
     if (embedded_only && sniff_kind(path) != FileKind::Raw) {
         error = std::string(kUnsupportedPrefix) + "embedded_only thumbnails require a RAW file";
         return false;
     }
     Probe probe;
-    if (!probe_file(path, probe, error)) return false;
+    if (!probe_file_impl(path, probe, error)) return false;
     if (probe.kind == FileKind::Heic || probe.kind == FileKind::Exr) {
         FloatImage image;
         if (!decode_extra(path, probe.kind, image, probe, error)) return false;
@@ -1006,6 +1017,106 @@ bool thumbnail(const fs::path& path, uint32_t long_edge, Rgba8& out, std::string
     out.width = w; out.height = h; out.rgba = std::move(rgba);
     source = "decode";
     return true;
+}
+
+namespace {
+#if !defined(SPEKTRALAB_RAW_CANDIDATE_MODULE)
+struct CandidateApi {
+    RawCandidateRun run = nullptr;
+    RawCandidateFree release = nullptr;
+    CandidateApi() {
+        // Never search PATH/current directory for a decoder DLL. The matching
+        // module ships next to the host and remains loaded for the process.
+#if defined(_WIN32)
+        const auto path = executable_dir(nullptr) / "spektralab-raw-candidate.dll";
+        const auto module = LoadLibraryExW(path.c_str(), nullptr,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (module) {
+            run = reinterpret_cast<RawCandidateRun>(GetProcAddress(module, "spk_raw_candidate_run"));
+            release = reinterpret_cast<RawCandidateFree>(GetProcAddress(module, "spk_raw_candidate_free"));
+        }
+#else
+        const auto path = executable_dir(nullptr) / "spektralab-raw-candidate.so";
+        const auto module = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (module) {
+            run = reinterpret_cast<RawCandidateRun>(dlsym(module, "spk_raw_candidate_run"));
+            release = reinterpret_cast<RawCandidateFree>(dlsym(module, "spk_raw_candidate_free"));
+        }
+#endif
+    }
+};
+std::unique_ptr<RawCandidateResult, RawCandidateFree> candidate(RawCandidateRequest request, std::string& error) {
+    static const CandidateApi api;
+    if (!api.run || !api.release) {
+        error = "candidate RAW decoder module is missing or incompatible; extract the complete application package";
+        return {nullptr, nullptr};
+    }
+    request.result_size = sizeof(RawCandidateResult);
+    auto result = std::unique_ptr<RawCandidateResult, RawCandidateFree>(api.run(&request), api.release);
+    if (!result) error = "candidate RAW decoder failed (memory or module ABI)";
+    else if (!result->ok) error = result->error;
+    return result;
+}
+#endif
+}
+
+bool probe_file(const fs::path& path, Probe& out, std::string& error) {
+    if (probe_file_impl(path, out, error)) return true;
+#if !defined(SPEKTRALAB_RAW_CANDIDATE_MODULE)
+    if (sniff_kind(path) == FileKind::Raw) {
+        const auto stable_error = error;
+        auto result = candidate({kRawCandidateAbi, 0, &path}, error);
+        if (result && result->ok) { out = result->probe; error.clear(); return true; }
+        error = "LibRaw: " + stable_error + "; candidate: " + error;
+    }
+#endif
+    return false;
+}
+
+bool decode_linear_prophoto(const fs::path& path, const DecodeOptions& options, FloatImage& out,
+                            Probe& probe, std::string& error) {
+#if defined(SPEKTRALAB_RAW_CANDIDATE_MODULE)
+    return decode_linear_prophoto_impl(path, options, out, probe, error);
+#else
+    const bool raw = sniff_kind(path) == FileKind::Raw;
+    if (!raw || options.raw_decoder != "candidate") {
+        if (decode_linear_prophoto_impl(path, options, out, probe, error)) {
+            if (raw) probe.metadata.raw_decoder = "libraw-0.22.2";
+            return true;
+        }
+        if (!raw || options.raw_decoder == "libraw") return false;
+    }
+    const auto stable_error = error;
+    // Release any failed partial decode before trying a different backend.
+    out = FloatImage{};
+    auto result = candidate({kRawCandidateAbi, 0, &path, &options, 1}, error);
+    if (result && result->ok) {
+        out = result->image;
+        probe = result->probe;
+        probe.metadata.raw_decoder = "candidate-f4956c4";
+        std::fprintf(stderr, "raw_decoder: candidate-f4956c4 (%s)\n", options.raw_decoder.c_str());
+        error.clear();
+        return true;
+    }
+    if (options.raw_decoder == "auto") error = "LibRaw: " + stable_error + "; candidate: " + error;
+    return false;
+#endif
+}
+
+bool thumbnail(const fs::path& path, uint32_t long_edge, Rgba8& out, std::string& source,
+               std::string& error, bool embedded_only) {
+    if (thumbnail_impl(path, long_edge, out, source, error, embedded_only)) return true;
+#if !defined(SPEKTRALAB_RAW_CANDIDATE_MODULE)
+    if (sniff_kind(path) == FileKind::Raw) {
+        const auto stable_error = error;
+        auto result = candidate({kRawCandidateAbi, 0, &path, nullptr, 2, long_edge, embedded_only}, error);
+        if (result && result->ok) {
+            out = result->thumbnail; source = result->source; error.clear(); return true;
+        }
+        error = "LibRaw: " + stable_error + "; candidate: " + error;
+    }
+#endif
+    return false;
 }
 
 }  // namespace spkhost

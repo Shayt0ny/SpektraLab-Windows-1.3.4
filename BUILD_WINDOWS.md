@@ -6,7 +6,7 @@ retained for the earlier maintenance packages.
 
 This is the Windows maintenance release by **shayt0ny**, derived from
 [JamesQiu2005/SpektraLab](https://github.com/JamesQiu2005/SpektraLab) through
-[NANATATA's Windows port](https://github.com/YZH2006517/SpektraLab-Windows-NANATATA).
+NANATATA's earlier Windows port.
 See `RELEASE_NOTES_1.3.4_zh-CN.md` and the original licence files.
 
 Use Windows x64, PowerShell 7, Node/npm or pnpm, and Git. The helper scripts

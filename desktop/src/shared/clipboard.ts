@@ -29,11 +29,12 @@ export const GROUP_PATHS: Record<ClipboardGroup, string[]> = {
     'params.filmSide',
     'params.sideLengthMM',
     'params.grainActive',
+    'params.densityCurveGamma',
     'params.halationActive',
     'params.glareActive',
     'params.effects',
   ],
-  printEffects: ['params.printEffects', 'params.preflashExposure'],
+  printEffects: ['params.printEffects', 'params.preflashExposure', 'params.scannerWhiteCorrection', 'params.scannerBlackCorrection', 'params.scannerLensBlur'],
   scenePlacement: ['params.sceneLatitude', 'placementNeedsFit'],
 };
 

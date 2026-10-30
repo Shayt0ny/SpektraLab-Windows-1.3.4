@@ -33,6 +33,12 @@ const mac = {
 };
 
 describe('sidecar', () => {
+  it('round-trips the actual RAW decoder policy and rejects unknown policies', () => {
+    const decoded = decodeSidecar({ decode: { rawDecoder: 'candidate' } });
+    expect(decoded.decode.rawDecoder).toBe('candidate');
+    expect((encodeSidecar(decoded).decode as { rawDecoder: string }).rawDecoder).toBe('candidate');
+    expect(decodeSidecar({ decode: { rawDecoder: 'unknown' } }).decode.rawDecoder).toBeUndefined();
+  });
   it('round-trips per-photo film bypass and removes the old true value when switched off', () => {
     expect(newSidecar().noFilm).toBe(false);
     expect(decodeSidecar(mac).noFilm).toBe(false);

@@ -12,6 +12,7 @@ import { openDialog } from './actions';
 import { baseName } from '../platform';
 import type { PreviewGamut } from '../canvas/colorSpace';
 import { sourceGeometryFor } from '@shared/filmEdge';
+import { RawDevelopmentControl } from './RawDevelopmentControl';
 
 export function TopBar() {
   const leftCollapsed = useSettings((s) => s.leftCollapsed);
@@ -85,6 +86,7 @@ export function TopBar() {
           <button className={'action-pill' + (original ? ' active' : '')} disabled={!selection || filmCanvas} onClick={() => setOriginal(!original)} title={filmCanvas ? tz('Use Framing to view the source with Film Edge or Date Back.', '使用取景功能查看带片边或日期后背的原始画面。') : tz('Show the current decode, before film simulation (hold Space).', '显示当前解码、未经胶片模拟的画面（按住空格键）。')}>
             {t('actionOriginal')}
           </button>
+          <RawDevelopmentControl key={engine ?? 'no-engine'} />
         </div>
         <div className="topbar-group topbar-display-group">
           <DropdownMenu.Root>

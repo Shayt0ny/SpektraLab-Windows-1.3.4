@@ -136,7 +136,8 @@ function CameraSection() {
   const vignette = useSession((s) => shownAdjustments(s).vignette.amount);
   const ae = aeMethodOf(p);
   const lens = (focus ? state.pairInfo?.[focus]?.metadata : state.metadata)?.lens_correction;
-  const lensReady = lens?.available === true && !!state.hello?.methods?.includes(state.pair ? 'update_pair' : 'redecode') && !state.batchExporting;
+  const customLens = !!selectedDecode(state).lensProfile;
+  const lensReady = (lens?.available === true || customLens) && !!state.hello?.methods?.includes(state.pair ? 'update_pair' : 'redecode') && !state.batchExporting;
   const lensReason = lens?.reason || tz('No matching lens profile is available for this photograph.', '此照片没有匹配的镜头配置文件。');
   const lensParts = lens ? [lens.distortion && tz('distortion', '畸变'), lens.tca && tz('colour fringing', '横向色差'), lens.vignetting && tz('vignetting', '暗角')].filter(Boolean).join(' · ') : '';
   const wb = useWhiteBalance();
@@ -147,6 +148,7 @@ function CameraSection() {
     { value: 'protect_highlights', label: t('meteringProtectHighlights') },
     { value: 'protect_shadows', label: t('meteringProtectShadows') },
   ];
+  options.push({ value: 'center_weighted', label: tz('Original centre-weighted meter', '原版中央加权测光') });
   if (ae === 'legacy') options.push({ value: 'legacy', label: t('meteringCenterWeightedLegacy') });
   const asShot = !p.autoExposure && p.exposureCompensationEV === 0;
   return (
@@ -287,7 +289,7 @@ function FilmFormatSection() {
           setFilmFrame('135');
           setFilmSide('short');
         }
-        setParams((q) => ({ ...q, grainActive: true, halationActive: true, glareActive: true, effects: EFFECTS_DEFAULT }));
+        setParams((q) => ({ ...q, densityCurveGamma: 1, grainActive: true, halationActive: true, glareActive: true, effects: EFFECTS_DEFAULT }));
       }}
       resetHelp={t('helpResetFilmFormat')}
       menu={[
@@ -343,6 +345,7 @@ function FilmFormatSection() {
         />
       </div>
       <ToggleRow label={t('filmGrain')} on={p.grainActive} onChange={(v) => setParams((q) => ({ ...q, grainActive: v }))} testId="grain-toggle" />
+      <ScrubSlider label={tz('Film response gamma', '胶片响应 Gamma')} value={p.densityCurveGamma} range={[.2, 4]} zero={1} snap={.1} format={(v) => v.toFixed(2)} onChange={(v) => setParams((q) => ({ ...q, densityCurveGamma: v }))} testId="density-gamma" />
       {decouple && strength(t('filmGrainStrength'), 'grain', p.grainActive)}
       <ToggleRow label={t('filmHalation')} on={p.halationActive} onChange={(v) => setParams((q) => ({ ...q, halationActive: v }))} />
       {noLayer ? (

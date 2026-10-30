@@ -64,6 +64,8 @@ import { resolveDisplaySpace } from './colorSpace';
 import { inTauri } from '../host/transport';
 import { onFrameDrop } from '../windows/frameDrag';
 import { clampZoom } from './zoom';
+import { recoveryTextureLimit } from './displayUpload';
+import { platform } from '../platform';
 
 const SURROUND = 0x5f / 255;
 
@@ -113,6 +115,9 @@ export function Canvas() {
   const [size, setSize] = useState({ width: 0, height: 0, dpr: 1 });
   const [glError, setGlError] = useState<string | null>(null);
   const [glVersion, setGlVersion] = useState(0);
+  const [canvasGeneration, setCanvasGeneration] = useState(0);
+  const recoveryLimit = useRef<number | null>(null);
+  const displayLosses = useRef(0);
   const [histogram, setHistogram] = useState<Histogram | null>(null);
   const [straightenLine, setStraightenLine] = useState<{ from: Point; to: Point } | null>(null);
   const [pairMenu, setPairMenu] = useState<{ x: number; y: number; side: PairSide } | null>(null);
@@ -150,9 +155,11 @@ export function Canvas() {
   useEffect(() => {
     const c = canvas.current;
     if (!c) return;
+    let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
     const initialize = () => {
+      clearTimeout(recoveryTimer);
       try {
-        gl.current = new GLRenderer(c);
+        gl.current = new GLRenderer(c, recoveryLimit.current ?? Infinity);
         uploaded.current = { print: null, original: null };
         noteTextureLimit(gl.current.maxTexture);
         setGlError(null);
@@ -161,21 +168,30 @@ export function Canvas() {
     };
     const lost = (e: Event) => {
       e.preventDefault();
+      recoveryLimit.current = recoveryTextureLimit(recoveryLimit.current);
+      displayLosses.current++;
       gl.current = null;
       uploaded.current = { print: null, original: null };
-      setGlError('Display connection lost; waiting for recovery. 显示连接已断开，正在等待恢复。');
+      noteTextureLimit(recoveryLimit.current);
+      setGlError('Display connection lost; rebuilding a smaller preview. 显示连接已断开，正在重建较小预览。');
+      platform().log('warn', `display: context lost; recovery=${displayLosses.current}, texture_limit=${recoveryLimit.current}`);
+      // A driver reset may never send webglcontextrestored. A fresh canvas
+      // gets a fresh context instead of waiting forever on the dead one.
+      if (displayLosses.current <= 3)
+        recoveryTimer = setTimeout(() => setCanvasGeneration((n) => n + 1), 1500);
       setGlVersion((n) => n + 1);
     };
     c.addEventListener('webglcontextlost', lost);
     c.addEventListener('webglcontextrestored', initialize);
     initialize();
     return () => {
+      clearTimeout(recoveryTimer);
       c.removeEventListener('webglcontextlost', lost);
       c.removeEventListener('webglcontextrestored', initialize);
       gl.current?.dispose();
       gl.current = null;
     };
-  }, []);
+  }, [canvasGeneration]);
 
   // The browser owns the final monitor ICC conversion. Re-evaluate when the
   // window moves between displays; a requested P3 mode is used only when the
@@ -299,7 +315,7 @@ export function Canvas() {
     };
     r.draw(state);
     notePreviewDrawn();
-  }, [imageVersion, displaySpace, layout?.zoom, layout?.offset.x, layout?.offset.y, size, geometry, adjustments, cropping, framing, comparing, comparePosition, showingOriginal, originalFallback, layout]);
+  }, [glVersion, imageVersion, displaySpace, layout?.zoom, layout?.offset.x, layout?.offset.y, size, geometry, adjustments, cropping, framing, comparing, comparePosition, showingOriginal, originalFallback, layout]);
 
   // The output, small: navigator and histogram (the canvas's frame, trap 33).
   useEffect(() => {
@@ -548,7 +564,7 @@ export function Canvas() {
       }}
       data-testid="canvas"
     >
-      <canvas ref={canvas} className="canvas-gl" />
+      <canvas key={canvasGeneration} ref={canvas} className="canvas-gl" />
       {pair && pairGates && layout && <svg className="crop-overlay" width="100%" height="100%" data-testid="pair-overlay">
         {PAIR_SIDES.map((side) => {
           const r = pairGates[side], x = css(layout.offset.x + r.x * layout.outSize.width), y = css(layout.offset.y + r.y * layout.outSize.height);
@@ -566,7 +582,9 @@ export function Canvas() {
           <button role="menuitem" onClick={() => { void setPairHole(pairMenu.side, null); setPairMenu(null); }}>{tz('Remove frame', '移除照片')}</button>
         </>}
       </div>}
-      {glError && <div className="canvas-message">{tz('This display cannot draw the picture (WebGL2): ', '此显示无法绘制画面（WebGL2）：') + glError}</div>}
+      {glError && <div className="canvas-message">{tz('This display cannot draw the picture (WebGL2): ', '此显示无法绘制画面（WebGL2）：') + glError}
+        <button className="btn" onClick={() => { displayLosses.current = 0; setCanvasGeneration((n) => n + 1); }}>{tz('Rebuild preview', '重建预览')}</button>
+      </div>}
       {selection && lastError && !frameImages.print && !frameImages.original && !glError && <div className="canvas-message" role="alert">{lastError}</div>}
       {!selection && !glError && <div className="canvas-message canvas-empty" data-testid="canvas-empty">
         <div className="canvas-empty-actions" onPointerDown={(e) => e.stopPropagation()}

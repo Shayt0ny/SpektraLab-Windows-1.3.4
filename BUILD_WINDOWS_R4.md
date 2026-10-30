@@ -5,6 +5,15 @@ Version: 1.3.4-win.4. Official reference:
 commit `fa6096fd74c6f5328dfe78519d82cf5caaa6797c`.
 This supersedes the native-host instructions in BUILD_WINDOWS.md for win.4.
 
+win.7 addition: run `python engine/setup-raw-candidate.py --deps build/deps`
+before CMake. It verifies the fixed candidate archive and existing source tree;
+the source package supplies the same archive in `third_party_sources/` for
+offline use. `SPEKTRALAB_RAW_CANDIDATE_SOURCE` selects its extracted path.
+Build/stage the matching `spektralab-raw-candidate.dll` beside the host and keep
+`Nikon-HE-NOTICE.txt` plus the LibRaw LGPL text. This is a separate module, not
+a replacement of the stable LibRaw archive. `SPEKTRALAB_RAW_CANDIDATE=OFF` is
+available for builds that intentionally omit the optional backend.
+
 Use PowerShell 7, Python 3.12+, Git, CMake, a MinGW C/C++ toolchain, Ninja,
 Meson 1.9.2, glslang, Vulkan headers and GNU Rust. Tools remain build-only;
 there is no Python runtime dependency in the desktop program.

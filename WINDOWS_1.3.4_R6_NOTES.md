@@ -22,5 +22,5 @@ host 或在压缩包内运行。win.5 旧包保持原样。
 
 原作与官方 Windows beta：JamesQiu2005，https://github.com/JamesQiu2005/SpektraLab
 官方基础：spektralab-windows-v1.3.4-beta.1 / fa6096fd74c6f5328dfe78519d82cf5caaa6797c
-早期 Windows 移植：NANATATA，https://github.com/YZH2006517/SpektraLab-Windows-NANATATA
-本版维护：shayt0ny，https://github.com/Shayt0ny/SpektraLab-Windows-1.3.4
+早期 Windows 移植：NANATATA（历史移植记录）
+本版维护：shayt0ny

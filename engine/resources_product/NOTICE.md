@@ -1,8 +1,11 @@
 # `engine/resources_product/` — the product's own data
 
 These files are SpektraLab's, not spektrafilm's. `engine/resources/` is spektrafilm's baked output
-(28 profiles, CC BY-SA 4.0, unmodified) and stays that way; nothing here is copied or derived from
-an array in it. Keeping the two directories apart is what keeps that statement true.
+(28 profiles, CC BY-SA 4.0; their original measurement arrays are preserved). Eight paper files
+also carry SpektraLab's added `data.edr_tone_map` output calibration; those file additions are
+documented in `Profiles-and-LUTs-CHANGELOG.txt` and are not upstream measurements. Nothing here
+is copied or derived from an array in those profiles. Keeping the two directories apart records
+that distinction.
 
 | File | What it is | Built from |
 |---|---|---|

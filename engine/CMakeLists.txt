@@ -166,8 +166,9 @@ if(SPEKTRALAB_PORTABLE_BACKEND)
         add_custom_target(spektralab_vulkan_resources
             COMMAND "${CMAKE_COMMAND}" -E copy_directory
                     "${CMAKE_CURRENT_SOURCE_DIR}/resources" "${vulkan_resource_dir}"
-            # Product profiles overlay only the staged directory. The original
-            # spektrafilm resources stay byte-identical and separately attributed.
+            # Product profiles overlay only the staged directory. Upstream
+            # measurement arrays stay intact; inherited paper EDR additions
+            # are documented separately in Profiles-and-LUTs-CHANGELOG.txt.
             COMMAND "${CMAKE_COMMAND}" -E copy_directory
                     "${CMAKE_CURRENT_SOURCE_DIR}/resources_product/profiles" "${vulkan_resource_dir}/profiles"
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -323,6 +324,13 @@ if(SPEKTRALAB_PORTABLE_BACKEND)
                 add_test(NAME spk_vulkan_${probe}
                     COMMAND spk_vulkan_${probe} "${vulkan_resource_dir}")
             endforeach()
+            add_executable(spk_vulkan_memory_types tests/gpu_vulkan_memory_types.cpp)
+            target_include_directories(spk_vulkan_memory_types PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+            target_link_libraries(spk_vulkan_memory_types PRIVATE spk_volk)
+            if(MINGW AND SPEKTRALAB_STATIC_RUNTIME)
+                target_link_options(spk_vulkan_memory_types PRIVATE -static)
+            endif()
+            add_test(NAME spk_vulkan_memory_types COMMAND spk_vulkan_memory_types)
 
             add_executable(spk_imprint_raster tests/imprint_raster.cpp)
             target_include_directories(spk_imprint_raster PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

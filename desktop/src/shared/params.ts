@@ -67,7 +67,7 @@ export function filmFormatMM(side: FilmSide, sideLengthMM: number, aspect: numbe
 
 // ----------------------------------------------------------- exposure method
 
-export const EXPOSURE_METHODS = ['balanced', 'center', 'protect_highlights', 'protect_shadows'] as const;
+export const EXPOSURE_METHODS = ['balanced', 'center', 'protect_highlights', 'protect_shadows', 'center_weighted'] as const;
 export type ExposureMethod = (typeof EXPOSURE_METHODS)[number];
 /** The AE Method pill: `custom` is the meter switched off, not a fifth meter. */
 export type AEMethod = 'custom' | ExposureMethod | 'legacy';
@@ -275,6 +275,10 @@ export interface FilmParams {
   filmSide: FilmSide;
   sideLengthMM: number;
   grainActive: boolean;
+  densityCurveGamma: number;
+  scannerWhiteCorrection: boolean;
+  scannerBlackCorrection: boolean;
+  scannerLensBlur: number;
   halationActive: boolean;
   printBrightnessStops: number;
   yFilterShift: number;
@@ -306,6 +310,10 @@ export const FILM_PARAMS_DEFAULT: FilmParams = {
   filmSide: 'short',
   sideLengthMM: 24,
   grainActive: true,
+  densityCurveGamma: 1,
+  scannerWhiteCorrection: false,
+  scannerBlackCorrection: false,
+  scannerLensBlur: 0,
   halationActive: true,
   printBrightnessStops: 0,
   yFilterShift: 0,
@@ -476,6 +484,10 @@ export function wire(p: FilmParams, gate: FeatureGate = ALL_FEATURES, catalog?: 
     { name: 'auto_exposure', value: p.autoExposure, layer: 'shoot' },
     { name: 'film_format_mm', value: clamp(filmFormatForWire(p, gate), 4, 200), layer: 'shoot' },
     { name: 'grain_active', value: p.grainActive, layer: 'shoot' },
+    { name: 'density_curve_gamma', value: clamp(p.densityCurveGamma ?? 1, .2, 4), layer: 'shoot' },
+    { name: 'scanner_white_correction', value: !!p.scannerWhiteCorrection && !p.scanFilm && !p.digitalIntermediate && !catalog?.isPositive(p.filmStock), layer: 'print' },
+    { name: 'scanner_black_correction', value: !!p.scannerBlackCorrection && !p.scanFilm && !p.digitalIntermediate && !catalog?.isPositive(p.filmStock), layer: 'print' },
+    { name: 'scanner_lens_blur', value: p.printEffects ? clamp(p.scannerLensBlur ?? 0, 0, 20) : 0, layer: 'print' },
     { name: 'grain_sublayers_active', value: p.grainActive && p.effects.grainLayered && !catalog?.isMonochrome(p.filmStock), layer: 'shoot' },
     { name: 'halation_active', value: p.halationActive, layer: 'shoot' },
     { name: 'print_exposure', value: printExposure(p.printBrightnessStops), layer: 'print' },

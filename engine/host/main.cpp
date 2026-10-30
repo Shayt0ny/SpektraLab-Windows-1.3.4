@@ -40,6 +40,7 @@
 
 #include "image_io.hpp"
 #include "lens_correction.hpp"
+#include "raw_profile.hpp"
 #include "pair_source.hpp"
 #include "white_balance.hpp"
 #include "json.hpp"
@@ -152,6 +153,8 @@ struct Session {
     std::optional<spk::io::RawMetadata> raw_metadata;
     std::string output_space = "ProPhoto RGB";
     DecodeOptions decode;
+    std::string profile_key;
+    std::shared_ptr<const CameraCurveTransform> profile_transform;
     std::unique_ptr<PairSource> pair_source;
     Json pair, pair_info;
     std::string pair_signature;
@@ -245,6 +248,8 @@ std::string iso_datetime(const std::string& exif) {
 
 Json metadata_json(const Metadata& m) {
     Json j = Json::object();
+    if(!m.camera_curve.is_null())j.set("camera_curve",m.camera_curve);
+    if(!m.raw_decoder.empty())j.set("raw_decoder",str(m.raw_decoder));
     if (!m.make.empty()) j.set("make", str(m.make));
     if (!m.model.empty()) j.set("model", str(m.model));
     if (!m.lens.empty()) j.set("lens", str(m.lens));
@@ -429,14 +434,17 @@ Json m_hello(const Request&) {
     for (const char* m : {"hello", "ping", "shutdown", "params_schema", "print_lut_catalog", "memory_report",
                           "probe", "thumbnail", "open", "redecode", "close", "set_params", "get_params", "solve", "render",
                           "scene_latitude", "overscan_geometry", "preview_stock_lut", "cancel", "progress", "open_pair", "update_pair",
-                          "export_image", "export_cube", "export_di", "export_cineon", "write_image", "render_view", "export_frame", "render_proof", "render_source", "pick_neutral"})
+                          "export_image", "export_cube", "export_di", "export_cineon", "write_image", "render_view", "export_frame", "render_proof", "render_source", "pick_neutral", "camera_profile"})
         methods.push(str(m));
     r.set("methods", std::move(methods));
     Json view_formats = Json::array(); view_formats.push(str("rgba8")); view_formats.push(str("rgba16"));
     r.set("view_formats", std::move(view_formats));
     Json source_formats = Json::array(); source_formats.push(str("rgba8")); source_formats.push(str("rgba16"));
     r.set("source_formats", std::move(source_formats));
-    Json view_options = Json::array(); view_options.push(str("no_film"));
+    Json raw_decoders = Json::array();
+    for (const char* decoder : {"auto", "libraw", "candidate"}) raw_decoders.push(str(decoder));
+    r.set("raw_decoders", std::move(raw_decoders));
+    Json view_options = Json::array(); view_options.push(str("no_film")); view_options.push(str("camera_curve")); view_options.push(str("lcp"));
     r.set("view_options", std::move(view_options));
     Json frame_options = Json::array(); frame_options.push(str("no-film"));
     r.set("frame_options", std::move(frame_options));
@@ -578,6 +586,13 @@ DecodeOptions decode_options(const Json& decode) {
         throw HostError{"bad_request", "decode.raw_mode must be compatible16 or headroom"};
     for (const auto& kv : decode.fields()) {
         if (kv.first == "raw_mode") continue;
+        if (kv.first == "raw_decoder") {
+            if (!kv.second.is_string()) throw HostError{"bad_request", "decode.raw_decoder must be auto, libraw or candidate"};
+            options.raw_decoder = kv.second.as_string();
+            if (options.raw_decoder != "auto" && options.raw_decoder != "libraw" && options.raw_decoder != "candidate")
+                throw HostError{"bad_request", "decode.raw_decoder must be auto, libraw or candidate"};
+            continue;
+        }
         if (kv.first == "white_balance") {
             const Json& wb = kv.second;
             const std::string mode = optional_string(wb, "mode", "as_shot");
@@ -592,6 +607,16 @@ DecodeOptions decode_options(const Json& decode) {
         } else if (kv.first == "lens_correction") {
             if(!kv.second.is_bool())throw HostError{"bad_request","lens_correction must be boolean"};
             options.lens_correction=kv.second.as_bool(false);
+        } else if (kv.first == "lens_profile") {
+            if(!kv.second.is_object()||kv.second.dump().size()>2*1024*1024)
+                throw HostError{"bad_request","lens_profile must be a calibration object under 2 MB"};
+            options.lens_profile=kv.second;
+        } else if (kv.first == "apply_camera_curve") {
+            if(!kv.second.is_bool())throw HostError{"bad_request","apply_camera_curve must be boolean"};
+            options.apply_camera_curve=kv.second.as_bool();
+        } else if (kv.first == "camera_profile") {
+            if(!kv.second.is_object()||kv.second.dump().size()>8*1024*1024)throw HostError{"bad_request","invalid camera_profile"};
+            options.camera_profile=kv.second;
         } else {
             throw HostError{"unsupported", "decode." + kv.first + " is not supported by this host"};
         }
@@ -604,6 +629,22 @@ struct Decoded {
     Probe probe;
     double decode_ms = 0;
 };
+
+
+void camera_curve_after_decode(FloatImage& raw,Probe& probe,const DecodeOptions& options) {
+    if(!options.apply_camera_curve)return; // Exact legacy path: no copy, LUT or pixel arithmetic.
+    if(!raw.raw_metadata)throw HostError{"unsupported","camera curve requires a RAW photograph"};
+    const auto profile=options.camera_profile.is_null()?find_camera_profile(*raw.raw_metadata):options.camera_profile;
+    if(profile.is_null())throw HostError{"unsupported","camera curve is not configured; import a matching DCP or turn the switch off"};
+    try {
+        const auto transform=prepare_camera_profile(profile,*raw.raw_metadata,options.temperature_k.value_or(probe.metadata.as_shot_temperature_k.value_or(5500)));
+        FloatImage colored_raw=std::move(raw);
+        apply_camera_profile(colored_raw,*transform);
+        raw=std::move(colored_raw); // engine_open uploads this, never the pre-curve pixels.
+        probe.metadata.camera_curve=Json::object();probe.metadata.camera_curve.set("applied",Json(true));
+        probe.metadata.camera_curve.set("profile",profile.at("name"));probe.metadata.camera_curve.set("input",str("colored_raw"));
+    } catch(const std::exception& e){throw HostError{"unsupported",e.what()};}
+}
 
 Decoded decode_frame(const fs::path& path, const DecodeOptions& options) {
     std::error_code ec;
@@ -619,6 +660,7 @@ Decoded decode_frame(const fs::path& path, const DecodeOptions& options) {
         if (error.rfind(prefix, 0) == 0) throw HostError{"unsupported", error.substr(prefix.size())};
         throw HostError{"decode_failed", error};
     }
+    camera_curve_after_decode(d.frame,d.probe,options);
     d.decode_ms = ms_since(t0);
     return d;
 }
@@ -683,6 +725,7 @@ Json m_open(const Request& q) {
     s->metadata = d.probe.metadata;
     s->raw_metadata = std::move(d.frame.raw_metadata);
     s->decode = options;
+    s->profile_key.clear(); s->profile_transform.reset();
     s->output_space = output_space_of(opened.at("params"));
     {
         std::lock_guard<std::mutex> lock(g.sessions_mutex);
@@ -702,6 +745,10 @@ Json pair_decode_wire(const Json& settings) {
     Json wire = Json::object();
     if (settings.has("rawMode")) wire.set("raw_mode", settings.at("rawMode"));
     if (settings.has("lensCorrection")) wire.set("lens_correction", settings.at("lensCorrection"));
+    if (settings.has("lensProfile")) wire.set("lens_profile", settings.at("lensProfile"));
+    if (settings.has("apply_camera_curve")) wire.set("apply_camera_curve",settings.at("apply_camera_curve"));
+    if (settings.has("rawDecoder")) wire.set("raw_decoder",settings.at("rawDecoder"));
+    if (settings.at("cameraCurve").has("profile")) wire.set("camera_profile",settings.at("cameraCurve").at("profile"));
     const std::string mode = optional_string(settings, "whiteBalance", "As Shot");
     Json wb = Json::object(); wb.set("mode", str(mode == "As Shot" ? "as_shot" : "custom"));
     if (mode != "As Shot") {
@@ -742,7 +789,8 @@ Json m_pair(const Request& q, bool updating, bool parent_running = false) {
     auto decode=[&](const fs::path& file,const Json& settings,FloatImage& image,Probe& probe,std::string& why) {
         check_cancelled();spk::view::trim_idle_memory(g.engine);
         const auto options=decode_options(pair_decode_wire(settings));
-        return decode_linear_prophoto(file,options,image,probe,why);
+        if(!decode_linear_prophoto(file,options,image,probe,why))return false;
+        camera_curve_after_decode(image,probe,options);return true;
     };
     auto meter=[&](const FloatImage& image,const std::string& method) {
         Json probe=params;probe.set("auto_exposure",Json(true));probe.set("auto_exposure_method",str(method));
@@ -801,6 +849,7 @@ Json m_redecode(const Request& q) {
         s->handle = handle;
     }
     spk_session_release(old);
+    s->profile_key.clear();s->profile_transform.reset();
     s->width = d.frame.width;
     s->height = d.frame.height;
     s->metadata = d.probe.metadata;
@@ -954,6 +1003,37 @@ void log_node_timings(spk_session* session) {
     if (reply) spk_string_free(reply);
 }
 
+std::shared_ptr<const CameraCurveTransform> camera_transform(const std::shared_ptr<Session>& s,const Json& profile) {
+    if(profile.is_null())return {};
+    if(!s->raw_metadata)throw HostError{"unsupported","RAW development requires a RAW photograph"};
+    const double kelvin=s->decode.temperature_k.value_or(s->metadata.as_shot_temperature_k.value_or(5500));
+    const auto key=profile.dump()+"|"+std::to_string(kelvin);
+    if(key!=s->profile_key||!s->profile_transform) {
+        try {s->profile_transform=prepare_camera_profile(profile,*s->raw_metadata,kelvin);s->profile_key=key;}
+        catch(const std::exception& e){throw HostError{"unsupported",e.what()};}
+    }
+    return s->profile_transform;
+}
+
+Json m_camera_profile(const Request& q) {
+    auto s=find_session(q.params,false);
+    if(!s->raw_metadata||s->pair_source)throw HostError{"unsupported","select a single RAW photograph"};
+    Json profile;
+    try {
+        if(q.params.has("data")) {
+            const auto& data=q.params.at("data");
+            if(!data.is_array()||data.items().size()>8*1024*1024)throw HostError{"bad_request","DCP exceeds 8 MB"};
+            std::vector<uint8_t> bytes;bytes.reserve(data.items().size());
+            for(const auto& n:data.items()){double v=n.as_double(-1);if(!n.is_number()||v<0||v>255||v!=std::trunc(v))throw HostError{"bad_request","invalid DCP bytes"};bytes.push_back(uint8_t(v));}
+            profile=read_camera_profile(bytes,require_string(q.params,"name"));
+        } else profile=find_camera_profile(*s->raw_metadata);
+    } catch(const std::exception& e){throw HostError{"unsupported",e.what()};}
+    if(!profile.is_null())camera_transform(s,profile); // Validate before the UI saves it.
+    Json r=Json::object();r.set("profile",profile);
+    if(profile.is_null())r.set("reason",str("No matching installed DCP. Linear original retained."));
+    return r;
+}
+
 Json m_render_view(const Request& q, std::vector<uint8_t>& payload) {
     const auto started = Clock::now();
     auto s = find_session(q.params);
@@ -1035,8 +1115,23 @@ Json m_pick_neutral(const Request& q) {
     }
     if (!*raw) throw HostError{"unsupported", "neutral picking requires a RAW source"};
     spk::view::SourceSample sample; std::string error;
-    if (!spk::view::sample_source(s->handle, x.as_double(), y.as_double(), sample, error))
-        throw HostError{"bad_request", error};
+    if(s->pair_source && (s->pair.at("left").at("decode").at("apply_camera_curve").as_bool() || s->pair.at("right").at("decode").at("apply_camera_curve").as_bool()))
+        throw HostError{"unsupported","pick neutral on the individual RAW before applying its camera curve to a pair"};
+    if(s->decode.apply_camera_curve && !s->pair_source) {
+        // A camera curve is not invertible. Read the pre-curve linear patch
+        // on demand instead of inferring WB from already coloured pixels.
+        const double nx=x.as_double(),ny=y.as_double();
+        if(!std::isfinite(nx)||!std::isfinite(ny)||nx<0||nx>1||ny<0||ny>1)throw HostError{"bad_request","invalid neutral coordinates"};
+        auto options=s->decode;options.apply_camera_curve=false;
+        FloatImage linear;Probe probe;
+        if(!decode_linear_prophoto(utf8_path(s->path),options,linear,probe,error))throw HostError{"decode_failed",error};
+        const int cx=std::min(int(linear.width)-1,int(nx*linear.width)),cy=std::min(int(linear.height)-1,int(ny*linear.height));
+        sample.minimum.fill(INFINITY);sample.maximum.fill(-INFINITY);
+        for(int py=std::max(0,cy-2);py<=std::min(int(linear.height)-1,cy+2);++py)for(int px=std::max(0,cx-2);px<=std::min(int(linear.width)-1,cx+2);++px){
+            for(int c=0;c<3;++c){double v=linear.rgb[(size_t(py)*linear.width+px)*3+c];sample.mean[c]+=v;sample.minimum[c]=std::min(sample.minimum[c],v);sample.maximum[c]=std::max(sample.maximum[c],v);}++sample.samples;
+        }
+        for(double& v:sample.mean)v/=sample.samples;
+    } else if (!spk::view::sample_source(s->handle, x.as_double(), y.as_double(), sample, error))throw HostError{"bad_request", error};
     for(unsigned c=0;c<3;++c){sample.mean[c]/=gain;sample.minimum[c]/=gain;sample.maximum[c]/=gain;}
     if (!(*raw)->headroom_enabled)
         for (unsigned c = 0; c < 3; ++c)
@@ -1277,7 +1372,11 @@ Json m_export_frame(const Request& q, std::vector<uint8_t>* proof_payload = null
         if (q.params.has("decode")) {
             const auto requested = decode_options(q.params.at("decode"));
             if (requested.raw_mode != s->decode.raw_mode || requested.temperature_k != s->decode.temperature_k ||
-                requested.tint != s->decode.tint || requested.lens_correction != s->decode.lens_correction) {
+                requested.tint != s->decode.tint || requested.lens_correction != s->decode.lens_correction ||
+                requested.lens_profile.dump() != s->decode.lens_profile.dump() ||
+                requested.raw_decoder != s->decode.raw_decoder ||
+                requested.apply_camera_curve != s->decode.apply_camera_curve ||
+                (requested.apply_camera_curve && requested.camera_profile.dump()!=s->decode.camera_profile.dump())) {
                 // A pending UI redecode must not silently export older white balance.
                 // Keep the editor's session intact and render the frozen decode privately.
                 source_path = s->path;
@@ -1603,6 +1702,7 @@ void dispatch(const Request& q) {
     else if (m == "render") result = m_render(q, payload);
     else if (m == "render_view") result = m_render_view(q, payload);
     else if (m == "render_source") result = m_render_source(q, payload);
+    else if (m == "camera_profile") result = m_camera_profile(q);
     else if (m == "pick_neutral") result = m_pick_neutral(q);
     else if (m == "export_frame") result = m_export_frame(q);
     else if (m == "export_cineon") result = m_export_frame(q, nullptr, true);

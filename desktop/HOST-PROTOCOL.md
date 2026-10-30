@@ -129,6 +129,59 @@ scale Lightroom/ACR use. The camera side is LibRaw's XYZ→camera matrix, so
 difference 0.01/255). Both `compatible16` and `headroom` accept custom RAW white balance; raster inputs reject decode white balance. `lens_correction: true` uses the pinned Lensfun profile when the camera/lens match is unique; missing or ambiguous profiles and non-RAW inputs are explicitly `unsupported`
 (LibRaw supplies the sensor decode; bundled Lensfun supplies calibration).
 
+Camera curve and imported LCP extensions (2026-10-30): `hello.view_options`
+advertises `camera_curve` and `lcp` on supporting native hosts. `decode` also
+accepts `apply_camera_curve?: boolean` (default **false**),
+`camera_profile?: <DCP snapshot>` and `lens_profile?: <LCP calibration>`.
+
+RAW decoder selection (Windows 2026-10-31): `hello.raw_decoders` advertises
+`["auto","libraw","candidate"]`. `decode.raw_decoder` takes those exact names,
+defaults to `auto`, and is frozen with the per-photo decode/export snapshot
+(`decode.rawDecoder` in a sidecar or pair hole). `libraw` uses the unchanged
+official 0.22.2 decoder; `candidate` uses the isolated, pinned candidate module.
+`auto` first tries stable decoding, then retries a failed RAW decode with the
+candidate. Raster decoding and GPU rendering failures do not switch decoders.
+The candidate contains the public Nikon HE/HE* implementation plus fixes,
+not an official LibRaw HE release. Both failures are reported; an embedded
+JPEG is never substituted for editable RAW. `metadata.raw_decoder` identifies
+the actual backend (`libraw-0.22.2` / `candidate-f4956c4`). The module is loaded
+only beside the host, never from PATH or the current working directory. Its
+private ABI is same-build only; the host copies results and the module frees
+its own allocations. Distribute the matching DLL and corresponding sources.
+
+`camera_profile {session,name?,data?:byte[]}` reads a matching installed DCP
+or parses a caller-supplied DCP (max 8 MiB), validates its camera model and
+returns `{profile,reason?}`. Missing installed data returns `profile:null`;
+the UI retains OFF and shows an unconfigured placeholder. Unsupported DCP
+matrices/illuminants, mismatched cameras and malformed tables are explicit
+errors, never replaced by a generic look. The snapshot carries version 1,
+name, camera, description/copyright, and the supported DCP numeric tags.
+
+With the switch OFF, neither pixel arithmetic nor a LUT is added. With it ON:
+`LibRaw linear ProPhoto → optional lens correction → DCP colour/tone in
+ProPhoto (colored_raw) → spk_open → unchanged physical film/print pipeline`.
+This is a creative pre-film transform; its RGB primaries stay ProPhoto but
+its tone is no longer the unmodified scene-linear decode. No transfer curve
+is reinterpreted as sRGB/P3, and `input_cctf_decoding` stays false. Original
+preview, no-film view and film exports all use the resident chosen source.
+`metadata.camera_curve` reports `{applied:true,profile,input:"colored_raw"}`.
+Neutral picking reads an uncurved RAW patch on demand; curve-enabled pairs
+must pick neutral on their individual files first.
+
+`lens_profile` is an immutable version-1 normalized Adobe Camera Model
+calibration (name/lens/raw flag and bounded entries with focal, aperture,
+distance, crop, projection, base/green/red/blue/vignette models). Each model
+retains focal normalization, centre, scale and five coefficients. It overrides
+database matching only when `lens_correction:true`; JPEG LCPs are refused for
+RAW. Correction runs in sensor axes, including RAW-channel TCA, and an automatic
+crop preserves the output dimensions without black borders. The imported
+numbers are saved per photograph; deleting the library copy does not change
+other saved photographs. UI XML intake is limited to 8 MiB and rejects DTDs
+and entities; native normalized LCP requests are bounded to 2 MiB/4096 entries.
+Frame export compares both curve and lens snapshots against resident decode
+and privately re-decodes on a mismatch. A failed redecode leaves the previous
+editor session intact. No method writes the original RAW or imported profile.
+
 What a file is decoded *to* (the engine develops linear ProPhoto RGB, top row first; AGENTS.md traps 11–12): RAW through LibRaw; TIFF/JPEG/PNG through their embedded matrix/TRC ICC profile (D50 colorants to XYZ to ProPhoto, as ColorSync does); without a profile, 8-bit files are sRGB and 16-bit/float TIFFs are linear ProPhoto (the macOS decoder's rule for an untagged deep TIFF). TIFF: 8/16-bit integer and 32-bit float, RGB or grey, uncompressed/LZW/deflate/PackBits, strips or tiles; not BigTIFF or CMYK. RGB LUT ICC profiles use LittleCMS; malformed profiles are rejected explicitly. HEIC/HEIF/HIF supports SDR HEVC through libheif/libde265 with ICC or NCLX; PQ/HLG is explicitly unsupported. EXR supports flat first-part RGB/Y float32 data with embedded primaries or default Rec.709; deep EXR is unsupported.
 
 ### Sessions (one per open frame)

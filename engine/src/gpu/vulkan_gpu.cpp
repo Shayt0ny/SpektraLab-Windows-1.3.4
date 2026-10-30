@@ -1,6 +1,7 @@
 // vulkan_gpu.cpp -- synchronous Vulkan compute with explicit host transfers.
 //
-// Compute planes remain device-local; independent reusable host buffers stage
+// Compute planes prefer device-local memory, with compatible system-heap
+// fallback under pressure; independent reusable host buffers stage
 // uploads and readbacks in bounded chunks. Every submission completes before returning, so no
 // pooled or staging buffer can be reused while the device still reads it.
 // Command batching and native texture export are subsequent steps.
@@ -16,6 +17,7 @@
 #include <atomic>
 
 #include "volk.h"
+#include "vulkan_memory.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -28,6 +30,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -51,6 +54,7 @@ struct Buffer {
     VkMemoryPropertyFlags memory_flags = 0;
     int refs = 1;
     bool persistent = false;
+    bool staging = false;
 };
 
 namespace {
@@ -295,6 +299,19 @@ public:
             }
             memory_limit_bytes_ = uint64_t(mb) << 20;
         }
+        if(const char* limit=std::getenv("SPEKTRAFILM_TEST_VULKAN_LOCAL_BUDGET_MB");limit&&*limit) {
+            char* end=nullptr;const auto mb=std::strtoull(limit,&end,10);
+            if(end==limit||*end||*limit=='-'||mb>(UINT64_MAX>>20)){error="invalid test local heap budget";return false;}
+            test_local_budget_=uint64_t(mb)<<20;
+        }
+        for(uint32_t heap=0;heap<memory_properties_.memoryHeapCount;++heap)
+            std::fprintf(stderr,"vulkan_memory_heap index=%u size_mib=%llu device_local=%u\n",heap,
+                static_cast<unsigned long long>(memory_properties_.memoryHeaps[heap].size>>20),
+                unsigned((memory_properties_.memoryHeaps[heap].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)!=0));
+        std::fprintf(stderr,"vulkan_memory_device type=%u budget_extension=%u\n",unsigned(properties_.deviceType),unsigned(memory_budget_available_));
+        for(uint32_t i=0;i<memory_properties_.memoryTypeCount;++i)
+            std::fprintf(stderr,"vulkan_memory_type index=%u heap=%u flags=%u\n",i,memory_properties_.memoryTypes[i].heapIndex,
+                unsigned(memory_properties_.memoryTypes[i].propertyFlags));
 
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo queue_create{};
@@ -1039,7 +1056,7 @@ private:
         b->requested_bytes = bytes;
         b->persistent = persistent;
         bool memory_pressure = false;
-        if (!create_buffer(*b, error, false, false, &memory_pressure)) {
+        if (!create_buffer(*b, error, false, false, &memory_pressure, false)) {
             if (!memory_pressure) return {};
             // Already under buffers_mutex_. Synchronous submissions and zero
             // references make these blocks safe to reclaim. Keep live images,
@@ -1054,11 +1071,12 @@ private:
                     it = buffers_.erase(it);
                 } else ++it;
             }
-            if (!freed) return {};
-            if (std::getenv("SPEKTRAFILM_NODE_MEMORY"))
+            if (freed && std::getenv("SPEKTRAFILM_NODE_MEMORY"))
                 std::fprintf(stderr, "allocation_reclaim requested=%zu freed=%zu\n", bytes, freed);
             error.clear();
-            // One retry only; a genuine live working-set shortage still fails.
+            // Reclaim idle planes before spilling to another compatible heap.
+            // Even with nothing to reclaim, shared memory may still be usable.
+            // One retry only; a genuine all-heap working-set shortage fails.
             if (!create_buffer(*b, error)) return {};
         }
         Buffer* raw = b.release();
@@ -1088,7 +1106,7 @@ private:
     }
 
     bool create_buffer(Buffer& b, std::string& error, bool staging = false, bool readback = false,
-                       bool* memory_pressure = nullptr) {
+                       bool* memory_pressure = nullptr, bool allow_system_compute = true) {
         if (memory_pressure) *memory_pressure = false;
         VkBufferCreateInfo create{};
         create.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -1101,32 +1119,6 @@ private:
         if (result != VK_SUCCESS) { error = vk_error("vkCreateBuffer", result); return false; }
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(device_, b.handle, &requirements);
-        uint32_t memory_index = UINT32_MAX;
-        int best_score = -1;
-        for (uint32_t i = 0; i < memory_properties_.memoryTypeCount; ++i) {
-            const auto flags = memory_properties_.memoryTypes[i].propertyFlags;
-            const auto required = staging ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-            if (!(requirements.memoryTypeBits & (1u << i)) || !(flags & required)) continue;
-            // Compute planes stay on the device. Staging is chosen separately:
-            // CPU readback needs cached host memory, not a CPU mapping of VRAM.
-            int score = 0;
-            if (staging) {
-                if (readback && (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) score += 8;
-                if (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) score += 4;
-                if (!(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) score += 2;
-            } else if (!(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-                score += 1;
-            }
-            if (score > best_score) {
-                memory_index = i;
-                best_score = score;
-            }
-        }
-        if (memory_index == UINT32_MAX) {
-            error = staging ? "no host-visible Vulkan staging memory type" : "no device-local Vulkan compute memory type";
-            destroy_buffer(&b);
-            return false;
-        }
         VkMemoryAllocateInfo allocate_info{};
 #ifdef _WIN32
         // Device allocations can also consume Windows commit. Leave room for
@@ -1153,13 +1145,12 @@ private:
 #endif
         allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocate_info.allocationSize = requirements.size;
-        allocate_info.memoryTypeIndex = memory_index;
-        b.memory_type = memory_index;
-        b.memory_flags = memory_properties_.memoryTypes[memory_index].propertyFlags;
-        b.allocation_bytes = requirements.size;
-        const uint32_t heap = memory_properties_.memoryTypes[memory_index].heapIndex;
-        const uint64_t owned = heap_allocated_[heap].load();
-        uint64_t available = UINT64_MAX;
+        b.staging=staging;
+        std::array<uint64_t,VK_MAX_MEMORY_HEAPS> available{};
+        for(uint32_t heap=0;heap<memory_properties_.memoryHeapCount;++heap) {
+            const uint64_t size=memory_properties_.memoryHeaps[heap].size,owned=heap_allocated_[heap].load();
+            available[heap]=size>owned?size-owned:0;
+        }
         if (memory_budget_available_) {
             // Re-query on every fresh allocation: another app can change the
             // usable budget between the pre-render cleanup and any later node.
@@ -1169,35 +1160,71 @@ private:
             properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
             properties.pNext = &budget;
             vkGetPhysicalDeviceMemoryProperties2(physical_, &properties);
-            if (budget.heapBudget[heap]) {
+            for(uint32_t heap=0;heap<memory_properties_.memoryHeapCount;++heap)if (budget.heapBudget[heap]) {
                 const uint64_t headroom = std::min(uint64_t(256) << 20, uint64_t(budget.heapBudget[heap]) / 20);
                 const uint64_t usable = budget.heapBudget[heap] > headroom ? budget.heapBudget[heap] - headroom : 0;
-                available = usable > budget.heapUsage[heap] ? usable - budget.heapUsage[heap] : 0;
+                available[heap] = std::min(available[heap],usable > budget.heapUsage[heap] ? usable - budget.heapUsage[heap] : 0);
             }
         }
-        if (memory_limit_bytes_ && (memory_properties_.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
-            available = std::min(available, memory_limit_bytes_ > owned ? memory_limit_bytes_ - owned : 0);
-        if (requirements.size > available) {
-            critical_pressure_ = true;
-            if (memory_pressure) *memory_pressure = true;
-            error = "GPU memory budget exhausted: requested " + std::to_string((requirements.size + ((1u << 20) - 1)) >> 20) +
-                    " MiB, available " + std::to_string(available >> 20) +
-                    " MiB after safety reserve. Close other GPU applications and retry; "
-                    "use a smaller preview for editing. Export resolution has not been reduced.";
+        // The diagnostic compute ceiling is global across heaps. Spilling to
+        // system memory must not bypass a requested low-memory test limit.
+        if(memory_limit_bytes_ && !staging) {
+            const uint64_t used=compute_allocated_.load(),left=memory_limit_bytes_>used?memory_limit_bytes_-used:0;
+            for(auto& bytes:available)bytes=std::min(bytes,left);
+        }
+        if(test_local_budget_ && !staging)for(uint32_t heap=0;heap<memory_properties_.memoryHeapCount;++heap)
+            if(memory_properties_.memoryHeaps[heap].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT){const auto used=heap_allocated_[heap].load();available[heap]=std::min(available[heap],*test_local_budget_>used?*test_local_budget_-used:0);}
+        const auto candidates=vulkan_memory_candidates(memory_properties_,requirements.memoryTypeBits,available,staging,readback);
+        if(candidates.empty()){error="no compatible Vulkan buffer memory type";destroy_buffer(&b);return false;}
+        uint64_t largest_available=0;std::string allocation_error;
+        bool allocated=false;
+        for(const auto& candidate:candidates) {
+            if(!staging&&!allow_system_compute && !(memory_properties_.memoryTypes[candidate.index].propertyFlags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))continue;
+            largest_available=std::max(largest_available,candidate.available);
+            if(requirements.size>candidate.available)continue;
+            allocate_info.memoryTypeIndex=candidate.index;
+            b.memory_type=candidate.index;b.memory_flags=memory_properties_.memoryTypes[candidate.index].propertyFlags;
+            b.allocation_bytes=requirements.size;
+            result=vkAllocateMemory(device_,&allocate_info,nullptr,&b.memory);
+            if(result==VK_SUCCESS) {
+                heap_allocated_[candidate.heap].fetch_add(requirements.size);
+                if(!staging)compute_allocated_.fetch_add(requirements.size);
+                result=vkBindBufferMemory(device_,b.handle,b.memory,0);
+                if(result==VK_SUCCESS && staging) {
+                    result=vkMapMemory(device_,b.memory,0,VK_WHOLE_SIZE,0,&b.mapped);
+                    if(result!=VK_SUCCESS){b.mapped=nullptr;error=vk_error("Vulkan staging map",result);
+                        if(memory_pressure)*memory_pressure=result==VK_ERROR_OUT_OF_HOST_MEMORY||result==VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                        destroy_buffer(&b);return false;}
+                }
+                if(result==VK_SUCCESS){allocated=true;break;}
+                vkFreeMemory(device_,b.memory,nullptr);b.memory=VK_NULL_HANDLE;
+                heap_allocated_[candidate.heap].fetch_sub(requirements.size);
+                if(!staging)compute_allocated_.fetch_sub(requirements.size);
+            } else b.memory=VK_NULL_HANDLE;
+            allocation_error=vk_error("Vulkan buffer memory",result);
+            if(result!=VK_ERROR_OUT_OF_HOST_MEMORY && result!=VK_ERROR_OUT_OF_DEVICE_MEMORY)break;
+            // Try another compatible heap; never relabel CPU-only memory or
+            // assume Task Manager's shared-memory maximum is our budget.
+        }
+        if (!allocated) {
+            const bool shortage=allocation_error.empty()||result==VK_ERROR_OUT_OF_HOST_MEMORY||result==VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            if(shortage && allow_system_compute)critical_pressure_ = true;
+            if (memory_pressure) *memory_pressure = shortage;
+            error = allocation_error.empty() ? "GPU memory budget exhausted: requested " + std::to_string((requirements.size + ((1u << 20) - 1)) >> 20) +
+                    " MiB, available " + std::to_string(largest_available >> 20) +
+                    " MiB in the largest compatible heap after safety reserve. Close other GPU applications and retry; "
+                    "use a smaller preview for editing. Export resolution has not been reduced." : allocation_error;
+            if(allow_system_compute)for(const auto& candidate:candidates)
+                std::fprintf(stderr,"vulkan_allocation_refused bytes=%llu memory_type=%u heap=%u available_mib=%llu flags=%u\n",
+                    static_cast<unsigned long long>(requirements.size),candidate.index,candidate.heap,
+                    static_cast<unsigned long long>(candidate.available>>20),unsigned(memory_properties_.memoryTypes[candidate.index].propertyFlags));
             destroy_buffer(&b);
             return false;
         }
-        result = vkAllocateMemory(device_, &allocate_info, nullptr, &b.memory);
-        if (result == VK_SUCCESS) heap_allocated_[heap].fetch_add(requirements.size);
-        if (result == VK_SUCCESS) result = vkBindBufferMemory(device_, b.handle, b.memory, 0);
-        if (result == VK_SUCCESS && staging)
-            result = vkMapMemory(device_, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped);
-        if (result != VK_SUCCESS) {
-            error = vk_error("Vulkan buffer memory", result);
-            if (memory_pressure) *memory_pressure =
-                result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY;
-            destroy_buffer(&b);
-            return false;
+        if(!staging && !(b.memory_flags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !shared_fallback_logged_) {
+            shared_fallback_logged_=true;
+            std::fprintf(stderr,"vulkan_compute_fallback memory_type=%u heap=%u bytes=%llu device=%s\n",b.memory_type,
+                memory_properties_.memoryTypes[b.memory_type].heapIndex,static_cast<unsigned long long>(b.allocation_bytes),properties_.deviceName);
         }
         if (transfer_timings_) {
             std::fprintf(stderr,
@@ -1205,7 +1232,7 @@ private:
                 "\"memory_type\":%u,\"memory_flags\":%u,\"heap\":%u}\n",
                 staging ? (readback ? "read_staging" : "upload_staging") : "compute",
                 b.bytes, static_cast<unsigned long long>(b.allocation_bytes), b.memory_type,
-                uint32_t(b.memory_flags), memory_properties_.memoryTypes[memory_index].heapIndex);
+                uint32_t(b.memory_flags), memory_properties_.memoryTypes[b.memory_type].heapIndex);
         }
         return true;
     }
@@ -1217,6 +1244,7 @@ private:
             vkFreeMemory(device_, b->memory, nullptr);
             const uint32_t heap = memory_properties_.memoryTypes[b->memory_type].heapIndex;
             heap_allocated_[heap].fetch_sub(b->allocation_bytes);
+            if(!b->staging)compute_allocated_.fetch_sub(b->allocation_bytes);
         }
         b->mapped = nullptr;
         b->handle = VK_NULL_HANDLE;
@@ -1311,7 +1339,10 @@ private:
     bool properties2_available_ = false;
     bool memory_budget_available_ = false;
     uint64_t memory_limit_bytes_ = 0;
+    std::optional<uint64_t> test_local_budget_;
+    bool shared_fallback_logged_=false;
     std::array<std::atomic<uint64_t>, VK_MAX_MEMORY_HEAPS> heap_allocated_{};
+    std::atomic<uint64_t> compute_allocated_{0};
     std::atomic<bool> critical_pressure_{false};
     VkPhysicalDeviceMemoryProperties memory_properties_{};
     VkDevice device_ = VK_NULL_HANDLE;

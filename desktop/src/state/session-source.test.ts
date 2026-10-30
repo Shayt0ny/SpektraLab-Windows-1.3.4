@@ -36,6 +36,18 @@ beforeEach(async () => {
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe('decoded source preview', () => {
+  it('camera curve changes the native decode input and undo restores the original pipeline', async () => {
+    const profile = { version: 1 as const, name: 'owned.dcp', camera: 'Fixture', description: '', copyright: '', tags: {} };
+    session.setDecode((d) => ({ ...d, apply_camera_curve: true, cameraCurve: { profile } }));
+    await vi.advanceTimersByTimeAsync(351);
+    expect(fake.redecode).toHaveBeenLastCalledWith('s1', expect.objectContaining({ apply_camera_curve: true, camera_profile: profile }));
+    expect(fake.source).toHaveBeenCalled();
+    session.undo();
+    await vi.advanceTimersByTimeAsync(351);
+    const wire = fake.redecode.mock.calls.at(-1)?.[1];
+    expect(wire).not.toHaveProperty('apply_camera_curve');
+    expect(wire).not.toHaveProperty('camera_profile');
+  });
   it('bounds source readback, refreshes P3 and 100% detail, and does not transfer again for pan', async () => {
     await session.refreshOriginal();
     expect(fake.source).toHaveBeenCalledWith('s1', expect.objectContaining({ long_edge: 2560, display: 'srgb' }));

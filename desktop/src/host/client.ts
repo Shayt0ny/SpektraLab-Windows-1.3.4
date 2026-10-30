@@ -22,6 +22,7 @@ import { HostCallError, inTauri, type Transport } from './transport';
 import type { Adjustments } from '@shared/adjustments';
 import type { Geometry } from '@shared/geometry';
 import type { HalfFramePair } from '@shared/pair';
+import type { CameraProfile } from '@shared/rawDevelopment';
 
 export { HostCallError };
 
@@ -124,6 +125,9 @@ export class Host {
   /** Decode the session's file again with other decode settings; params are kept (R2). */
   async redecode(session: string, decode: object): Promise<OpenResult> {
     return (await this.call<OpenResult>('redecode', { session, decode }, 300_000)).result;
+  }
+  async cameraProfile(session: string, file?: { name: string; data: number[] }): Promise<{ profile: CameraProfile | null; reason?: string }> {
+    return (await this.call<{ profile: CameraProfile | null; reason?: string }>('camera_profile', { session, ...file }, 180_000)).result;
   }
   async renderSource(session: string, opts: { long_edge: number; display: 'srgb' | 'display-p3'; generation: number }): Promise<RgbaImage> {
     const snapshot = structuredClone(opts);

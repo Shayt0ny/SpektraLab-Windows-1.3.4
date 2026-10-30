@@ -15,6 +15,7 @@ import { RENDER_PREFERENCES_DEFAULT, renderPreferences } from '@shared/renderPre
 export type InterfaceScale = 100 | 115 | 130;
 export const INTERFACE_SCALES: InterfaceScale[] = [100, 115, 130];
 export const PREVIEW_EDGES = [3840, 2560, 1920, 1080] as const;
+export type RawDecoder = 'auto' | 'libraw' | 'candidate';
 export const PANEL_WIDTHS = { leftWidth: [232, 254, 380], rightWidth: [280, 288, 364] } as const;
 export function boundedPanelWidth(key: keyof typeof PANEL_WIDTHS, width: number): number {
   const [lo, normal, hi] = PANEL_WIDTHS[key];
@@ -26,6 +27,7 @@ export interface Settings {
   interfaceScale: InterfaceScale;
   previewLongEdge: number;
   previewGamut: PreviewGamut;
+  rawDecoder: RawDecoder;
   sideUnit: SideUnit;
   decoupleEffects: boolean;
   recalculateEffectsAfterCrop: boolean;
@@ -47,6 +49,7 @@ export const SETTINGS_DEFAULT: Settings = {
   interfaceScale: 115,
   previewLongEdge: 2560,
   previewGamut: 'srgb',
+  rawDecoder: 'auto',
   sideUnit: 'mm',
   decoupleEffects: false,
   ...RENDER_PREFERENCES_DEFAULT,
@@ -79,6 +82,7 @@ export function loadSettings(storage: Pick<Storage, 'getItem'> | null): Settings
     if (!INTERFACE_SCALES.includes(s.interfaceScale)) s.interfaceScale = SETTINGS_DEFAULT.interfaceScale;
     if (!(PREVIEW_EDGES as readonly number[]).includes(s.previewLongEdge)) s.previewLongEdge = SETTINGS_DEFAULT.previewLongEdge;
     if (!(['auto', 'srgb', 'display-p3'] as const).includes(s.previewGamut)) s.previewGamut = SETTINGS_DEFAULT.previewGamut;
+    if (!(['auto', 'libraw', 'candidate'] as const).includes(s.rawDecoder)) s.rawDecoder = 'auto';
     s.leftWidth = boundedPanelWidth('leftWidth', s.leftWidth);
     s.rightWidth = boundedPanelWidth('rightWidth', s.rightWidth);
     if (!Number.isInteger(s.filmEdgeBodySeed) || s.filmEdgeBodySeed < 0 || s.filmEdgeBodySeed > 2147483647) s.filmEdgeBodySeed = 0;

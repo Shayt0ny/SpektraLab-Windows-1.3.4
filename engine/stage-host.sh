@@ -25,6 +25,9 @@ host="$build/engine/host/$binary"
 rm -rf "$stage.partial"
 mkdir -p "$stage.partial/engine" "$stage.partial/licenses"
 cp "$host" "$stage.partial/"
+for module in "$build/engine/host/spektralab-raw-candidate.dll" "$build/engine/host/spektralab-raw-candidate.so"; do
+  [[ ! -f "$module" ]] || cp "$module" "$stage.partial/"
+done
 cp -R "$build/engine/resources/." "$stage.partial/engine/"
 [[ -f "$stage.partial/engine/io/sRGB.icc" ]] || { echo "io/sRGB.icc missing from resources" >&2; exit 1; }
 ls "$stage.partial/engine/vulkan/"*.spv >/dev/null
@@ -38,6 +41,8 @@ cp "$here/resources_product/NOTICE.md" "$lic/Product-profiles-NOTICE.md"
 cp "$here/resources_product/fonts/LICENSE" "$lic/Imprint-fonts-LICENSE.txt"
 cp "$here/resources_product/fonts/DejaVu-LICENSE" "$lic/Imprint-mono-font-DejaVu-LICENSE.txt"
 cp "$here/third_party/stb/LICENSE" "$lic/stb-LICENSE.txt"
+cp "$here/third_party/RawTherapee-NOTICE.txt" "$lic/RawTherapee-NOTICE.txt"
+cp "$here/third_party/nikon_he/NOTICE.txt" "$lic/Nikon-HE-NOTICE.txt"
 cp "$deps/LibRaw-0.22.2/LICENSE.LGPL" "$lic/LibRaw-LGPL-2.1.txt"
 cp "$deps/LibRaw-0.22.2/COPYRIGHT" "$lic/LibRaw-COPYRIGHT.txt"
 cp "$here/third_party/stb/LICENSE" "$lic/stb-LICENSE.txt"
@@ -55,6 +60,8 @@ this build was made from.
 Bundled third-party components:
   LibRaw 0.22.2        LGPL-2.1, statically linked; source: libraw.org, and
                        engine/setup-libraw.sh fetches the exact pinned tree.
+  RAW candidate        Separate module, pinned Redlamp LibRaw fork, LGPL-2.1;
+                       engine/setup-raw-candidate.py and Nikon-HE-NOTICE.txt.
   stb_image, stb_image_write, stb_truetype   public domain / MIT (stb-LICENSE.txt)
   volk                 MIT (volk-LICENSE.txt)
   Vulkan-Headers       Apache-2.0 OR MIT, compile time only

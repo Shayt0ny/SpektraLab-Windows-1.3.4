@@ -940,6 +940,27 @@ export function setDecode(fn: (d: DecodeSettings) => DecodeSettings) {
   scheduleRedecode();
 }
 
+export function setRawDecoder(mode: 'auto' | 'libraw' | 'candidate') {
+  const s = get();
+  if (s.batchExporting) return;
+  settingsStore.getState().set('rawDecoder', mode);
+  if (s.selection && isRawFrame() && !s.pair) {
+    setDecode((d) => ({ ...d, rawDecoder: mode }));
+    if (!s.engineSession) void flushSave().then(() => select(s.selection!)).catch((e) => noteError(tz('RAW decoder', 'RAW 解码器'), e));
+  } else if (s.pair) {
+    updatePair((p) => {
+      let pair = p;
+      for (const side of PAIR_SIDES) if (p[side] && isRawPath(p[side]!.path)) {
+        const hole = p[side]!;
+        const decode = { ...hole.decode, rawDecoder: mode };
+        pair = { ...pair, [side]: { ...hole, decode } };
+        void savePairDecode(hole.path, decode).catch((e) => noteError(tz('RAW decoder', 'RAW 解码器'), e));
+      }
+      return pair;
+    }, { defer: true });
+  }
+}
+
 /** Whether this host can re-decode (it lists `redecode` in `hello.methods`). */
 export function hostRedecodes(methods: readonly string[] | undefined): boolean {
   return !!methods?.includes('redecode');
@@ -969,10 +990,11 @@ async function redecodeNow() {
   const wire = decodeWire(s.sidecar.decode, isRawFrame());
   const key = JSON.stringify(wire);
   if (!wire || key === sentDecode || !hostRedecodes(s.hello?.methods)) {
+    void refreshOriginal();
     void requestPrint();
     return;
   }
-  set({ redecoding: true, decodeError: null, status: tz('Decoding with the new white balance…', '正在以新的白平衡解码…') });
+  set({ redecoding: true, decodeError: null, status: tz('Applying decode settings…', '正在应用解码设置…') });
   clearLatitude();
   try {
     const r = await host().redecode(sid, wire);
@@ -1679,6 +1701,8 @@ export async function select(path: string, options: { externalReload?: boolean; 
   if (gen !== openGen) return;
   const loaded = raw ? decodeSidecar(raw) : newSidecar();
   let sidecar = filmStageSidecar(loaded);
+  if (isRawPath(path) && get().hello?.raw_decoders)
+    sidecar = { ...sidecar, decode: { ...sidecar.decode, rawDecoder: settingsStore.getState().rawDecoder } };
   let pair: HalfFramePair | null = null;
   const sources = new Map<string, Sidecar>();
   let pairDocument: string | null = null;
@@ -1690,6 +1714,8 @@ export async function select(path: string, options: { externalReload?: boolean; 
       const hole: PairHole | null = pair[side]; if (!hole) continue;
       const ownRaw: unknown = await platform().sidecarLoad(hole.path).catch(() => null);
       const own: Sidecar = ownRaw ? decodeSidecar(ownRaw) : newSidecar();
+      if (isRawPath(hole.path) && get().hello?.raw_decoders)
+        own.decode = { ...own.decode, rawDecoder: settingsStore.getState().rawDecoder };
       sources.set(hole.path, own);
       pair = { ...pair, [side]: { ...hole, decode: own.decode, geometry: own.geometry } };
     }

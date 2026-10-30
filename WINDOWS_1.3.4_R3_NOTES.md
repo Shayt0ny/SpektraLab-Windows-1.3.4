@@ -22,9 +22,9 @@ TypeScript 和相关文件的 lint 检查通过。此前 win.2 的 90 项前端/
 
 原始项目：[JamesQiu2005/SpektraLab](https://github.com/JamesQiu2005/SpektraLab)
 
-Windows 移植：[NANATATA](https://github.com/YZH2006517/SpektraLab-Windows-NANATATA)
+Windows 移植：NANATATA（历史移植记录）
 
-本次 Windows 维护：[shayt0ny](https://github.com/Shayt0ny)
+本次 Windows 维护：shayt0ny
 
 使用方法：完全退出旧版，完整解压运行包后双击 `spektralab.exe`。
 保留同目录程序、DLL 和整个 `host` 文件夹；不要在压缩包内直接运行。

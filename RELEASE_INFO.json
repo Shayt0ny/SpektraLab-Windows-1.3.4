@@ -1,35 +1,62 @@
 {
   "product": "SpektraLab",
-  "version": "1.3.4",
+  "version": "1.3.4-win.7",
   "platform": "Windows x64",
   "maintainer": "shayt0ny",
-  "upstream": {
-    "url": "https://github.com/JamesQiu2005/SpektraLab",
-    "version": "1.3.4",
-    "commit": "fd891c6bc5eb350387602deb5c1ef9b6dcdab948"
+  "project_sources": [
+    {
+      "author": "Andrea Volpato",
+      "url": "https://github.com/andreavolpato/spektrafilm"
+    },
+    {
+      "author": "JamesQiu2005 (Hanze Qiu)",
+      "url": "https://github.com/JamesQiu2005/SpektraLab"
+    }
+  ],
+  "official_windows_base": {
+    "tag": "spektralab-windows-v1.3.4-beta.1",
+    "commit": "fa6096fd74c6f5328dfe78519d82cf5caaa6797c"
   },
-  "windows_base": {
-    "url": "https://github.com/YZH2006517/SpektraLab-Windows-NANATATA",
-    "credit": "NANATATA",
-    "commit": "d667dcf7173f8c582060c43fe222da59f0f68a75"
-  },
-  "source_state": "Windows maintenance changes are included in this source archive; base commit alone does not reproduce the release.",
+  "source_state": "Corresponding snapshot includes local Windows maintenance changes. No upload or publication performed.",
   "validation": {
-    "frontend_and_real_host_tests_passed": 84,
-    "engine_ctests_passed": 18,
-    "native_colour_browser_tests_passed": 2,
-    "additional_checks": [
-      "73 MP worker responsiveness",
-      "WebGL context recovery",
-      "73 MP full render and TIFF16 export",
-      "low VRAM refusal and recovery",
-      "source bypass and destination colour regressions",
-      "native version 1.3.4 and actual full-resolution display"
+    "frontend_tests_passed": 444,
+    "optional_frontend_realhost_tests_skipped": 1,
+    "native_ctests_passed": 49,
+    "targeted_browser_tests_passed": 8,
+    "precision_repeat_checks_passed": 10,
+    "nikon_he_reference_mosaics_matched": 12,
+    "checks": [
+      "ZR lossless and HE/HEstar, automatic and forced candidate, WB change and exact restoration",
+      "Six Nikon bodies: full mosaics match pinned candidate goldens",
+      "WebGL lost-context rebuild without restored event; actual pixels reappear",
+      "16-bit source interpolation and conditional-derivative boundary regression",
+      "DCP colored_raw reaches film; OFF exact with win.6; native LCP warp/autocrop and frozen export",
+      "Compatible shared GPU heap selection; real RW2 hashes normal vs forced-local-budget identical",
+      "Staged host/resources/candidate actual HEstar render, CLI help, local desktop startup and ZR pixels"
     ]
   },
-  "release_executables_sha256": {
-    "spektralab.exe": "0369d78748f8ef987f8b9d439c7856a999da25651bb725dfe370a1249726e338",
-    "spektralab-host.exe": "0dd76ad10ad28cc83aecd9d0a66c256a8c1c114ebdd16804a32f5791d79fa1e3",
-    "WebView2Loader.dll": "86545b66cdb0603bc26b626fb9ad610cb6e71f28d468f5ea66df23b03dda96d5"
+  "changes": [
+    "Pre-film DCP camera curve switch, default OFF",
+    "Imported Adobe RAW LCP actually applied",
+    "Additional existing film/scanner/meter controls",
+    "Compatible system GPU heap fallback with budgets/reserves",
+    "Automatic/libraw/candidate RAW decoder policy and isolated HE/HEstar candidate module",
+    "Exact missing Nikon ZR camera matrix",
+    "WebGL context rebuild with bounded recovery uploads",
+    "16-bit sampling derivatives computed before non-uniform branches"
+  ],
+  "known_limitations": [
+    "Candidate is a pinned public development branch, not an official LibRaw HE release; unsupported RAWs still fail explicitly.",
+    "Remote AMD/780M hardware was not directly tested; simulated context loss and local compatible shared heaps are separate evidence.",
+    "DCP does not guarantee exact Nikon Picture Control, Adobe Color or Apple RAW appearance; RAW clipping/soft-filter appearance not claimed fully fixed.",
+    "The requested 720p/1K/2K/4K/original preview preset change was cancelled and reverted; existing normal preview behavior is preserved."
+  ],
+  "executables_sha256": {
+    "spektralab.exe": "5c3b0d6ebf3c8827cd7773b976d41bcfddaaa0bbc20d68afb7970076efb84de6",
+    "spektralab-host.exe": "a31788dc16b27ef3e995568ca2ae0908a7d8ed242bbc432731a2b8af5bb752f6",
+    "spektralab-raw-candidate.dll": "3bbaf31cbb33dd402b04c0d1b21668e3274fb38e9174c972551978fb7ff996ac",
+    "WebView2Loader.dll": "86545b66cdb0603bc26b626fb9ad610cb6e71f28d468f5ea66df23b03dda96d5",
+    "agents/node.exe": "3602f2bb1a10f2cbab4c36886218a33c1ab3db87290e73b033c46c77147d0237",
+    "agents/agent.mjs": "064452305d56d3960d2283949bfd5737afa6eb6f37d0bcae6c5db25be2e53b71"
   }
 }

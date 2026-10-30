@@ -2,9 +2,10 @@
 
 ## 项目来源与署名
 
-1. 原始 macOS 项目：[JamesQiu2005/SpektraLab](https://github.com/JamesQiu2005/SpektraLab)。
-2. Windows 移植基础：[SpektraLab-Windows-NANATATA](https://github.com/YZH2006517/SpektraLab-Windows-NANATATA)，署名 NANATATA。
-3. 本版 Windows 继续维护、升级与修复：[shayt0ny](https://github.com/Shayt0ny)。
+1. 光谱胶片引擎与原始配置：[Andrea Volpato / spektrafilm](https://github.com/andreavolpato/spektrafilm)。
+2. 原生引擎移植与 macOS 应用：[JamesQiu2005 / SpektraLab](https://github.com/JamesQiu2005/SpektraLab)。
+
+Windows 维护：shayt0ny。最新整合说明见 [win.7](WINDOWS_1.3.4_R7_NOTES.md)。
 
 原作者、第三方组件、胶片与相纸数据的署名和许可证继续保留。
 软件为 GPL-3.0-or-later；数据及各组件按随附许可证授权。

@@ -20,6 +20,7 @@ import { type Geometry, type GeometryUniform, GEOMETRY_DEFAULT, outputPoint, uni
 import type { DisplaySpace } from '@shared/protocol';
 import type { RgbaImage } from '../host/client';
 import { previewSpace } from './colorSpace';
+import { displayUpload } from './displayUpload';
 
 /** Source UV → the geometry already baked into a host frame, column-major. */
 export function processedImageMap(g: Geometry | undefined, native: { width: number; height: number }): Float32Array {
@@ -107,12 +108,11 @@ uniform bool lCurves;
 
 // RGBA16UI is core WebGL2. Four exact integer fetches retain all 16 source
 // bits, then interpolate in float; no full-image Uint16-to-Float32 CPU copy.
-vec3 sample16(usampler2D image, vec2 uv) {
+vec3 sample16(usampler2D image, vec2 uv, vec2 footprint) {
   ivec2 size = textureSize(image, 0);
   // Integer textures cannot use hardware linear/mipmap filtering. Integrate
   // the covered texels when fitting a large frame into a small viewport;
   // four point samples alone turn fine grain into false coloured blocks.
-  vec2 footprint = fwidth(uv * vec2(size));
   if (max(footprint.x, footprint.y) > 1.001) {
     vec2 extent = max(footprint, vec2(1.0));
     vec2 low = uv * vec2(size) - extent * 0.5;
@@ -229,27 +229,28 @@ void main() {
   } else {
     vec2 px = vUv * uViewport;
     ouv = (px - uOffset) / uOutSize;
-    if (ouv.x < 0.0 || ouv.y < 0.0 || ouv.x > 1.0 || ouv.y > 1.0) {
-      outColor = vec4(vec3(uSurround), 1.0);
-      return;
-    }
   }
   vec2 suv = geometryMap(ouv);
-  if (suv.x < 0.0 || suv.y < 0.0 || suv.x > 1.0 || suv.y > 1.0) {
+  vec2 imageUv = (uImageMap * vec3(suv, 1.0)).xy;
+  // Derivatives after an edge/split early return are undefined in neighbouring
+  // fragments. Compute both footprints before any pixel-dependent branch.
+  vec2 sourceFootprint = fwidth(suv * vec2(textureSize(uOriginal16, 0)));
+  vec2 imageFootprint = fwidth(imageUv * vec2(textureSize(uImage16, 0)));
+  if (any(lessThan(ouv, vec2(0.0))) || any(greaterThan(ouv, vec2(1.0))) ||
+      any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) {
     outColor = vec4(vec3(uSurround), 1.0);
     return;
   }
   bool before = uCompare == 2 || (uCompare == 1 && ouv.x < uSplit);
   vec3 c;
   if (before && uHasOriginal) {
-    c = displayConvert(uOriginalWide ? sample16(uOriginal16, suv) : texture(uOriginal, suv).rgb, uOriginalSpace);
+    c = displayConvert(uOriginalWide ? sample16(uOriginal16, suv, sourceFootprint) : texture(uOriginal, suv).rgb, uOriginalSpace);
   } else if (uHasImage) {
-    vec2 imageUv = (uImageMap * vec3(suv, 1.0)).xy;
     if (any(lessThan(imageUv, vec2(0.0))) || any(greaterThan(imageUv, vec2(1.0)))) {
       outColor = vec4(vec3(uSurround), 1.0);
       return;
     }
-    c = uImageWide ? sample16(uImage16, imageUv) : texture(uImage, imageUv).rgb;
+    c = uImageWide ? sample16(uImage16, imageUv, imageFootprint) : texture(uImage, imageUv).rgb;
     if (!uImageProcessed) c = layer2(c, suv);
     c = displayConvert(c, uImageSpace);
   } else {
@@ -302,13 +303,13 @@ export class GLRenderer {
   private fboSize = { width: 0, height: 0 };
   readonly maxTexture: number;
 
-  constructor(canvas: HTMLCanvasElement | OffscreenCanvas) {
+  constructor(canvas: HTMLCanvasElement | OffscreenCanvas, textureLimit = Infinity) {
     const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false, preserveDrawingBuffer: true }) as WebGL2RenderingContext | null;
     if (!gl) throw new Error('WebGL2 is not available in this webview');
     this.gl = gl;
     this.floatCanvas = typeof (gl as WebGL2RenderingContext & { drawingBufferStorage?: unknown }).drawingBufferStorage === 'function'
       && !!gl.getExtension('EXT_color_buffer_float');
-    this.maxTexture = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    this.maxTexture = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE) as number, textureLimit);
     this.program = this.link();
     const buf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -383,9 +384,8 @@ export class GLRenderer {
     const wide = img?.format === 'rgba16';
     this.clearTexture(wide ? tex : integer, !wide);
     if (!img) { this.clearTexture(tex, false); return false; }
-    if (img.width > this.maxTexture || img.height > this.maxTexture)
-      throw new Error(`Image ${img.width} × ${img.height} exceeds this display's texture limit (${this.maxTexture}).`);
     if (img.data.byteLength !== img.width * img.height * (wide ? 8 : 4)) return false;
+    img = displayUpload(img, this.maxTexture);
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, wide ? integer : tex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -393,6 +393,11 @@ export class GLRenderer {
     gl.texImage2D(gl.TEXTURE_2D, 0, wide ? gl.RGBA16UI : gl.RGBA8, img.width, img.height, 0,
       wide ? gl.RGBA_INTEGER : gl.RGBA, wide ? gl.UNSIGNED_SHORT : gl.UNSIGNED_BYTE,
       wide ? new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2) : bytes);
+    const error = gl.getError();
+    if (error !== gl.NO_ERROR) {
+      if (error === gl.OUT_OF_MEMORY) gl.getExtension('WEBGL_lose_context')?.loseContext();
+      throw new Error(`Display texture upload failed (${error}); rebuild preview to retry.`);
+    }
     if (!wide) {
       gl.generateMipmap(gl.TEXTURE_2D);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.getError() === gl.NO_ERROR ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);

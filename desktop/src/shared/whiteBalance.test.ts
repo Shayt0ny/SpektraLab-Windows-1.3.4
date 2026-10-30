@@ -35,6 +35,12 @@ describe('the As Shot boxes (WhiteBalanceBoxes)', () => {
 });
 
 describe('the wire', () => {
+  it('freezes the selected RAW decoder in decode requests and ignores it on raster files', () => {
+    for (const rawDecoder of ['auto','libraw','candidate'] as const) {
+      expect(decodeWire({ ...DECODE_DEFAULT, rawDecoder }, true)).toEqual({ white_balance: { mode: 'as_shot' }, raw_decoder: rawDecoder });
+      expect(decodeWire({ ...DECODE_DEFAULT, rawDecoder }, false)).toBeNull();
+    }
+  });
   it('sends a requested Lensfun correction independently of white balance and keeps raster decode untouched', () => {
     expect(decodeWire({ ...DECODE_DEFAULT, lensCorrection: true }, true)).toEqual({ white_balance: { mode: 'as_shot' }, lens_correction: true });
     expect(decodeWire({ ...DECODE_DEFAULT, lensCorrection: true }, false)).toBeNull();

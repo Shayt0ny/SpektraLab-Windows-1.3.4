@@ -17,4 +17,6 @@ mkdirSync(resolve(out, 'licenses'), { recursive: true });
 for (const f of readdirSync(resolve(app, 'Licenses'))) {
   if (f.endsWith('.txt')) cpSync(resolve(app, 'Licenses', f), resolve(out, 'licenses', f));
 }
+cpSync(resolve(here, '../../engine/third_party/RawTherapee-NOTICE.txt'), resolve(out, 'licenses/RawTherapee-NOTICE.txt'));
+cpSync(resolve(here, '../../engine/third_party/nikon_he/NOTICE.txt'), resolve(out, 'licenses/Nikon-HE-NOTICE.txt'));
 console.log('assets: copied to public/assets');

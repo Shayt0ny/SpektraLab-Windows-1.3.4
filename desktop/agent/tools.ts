@@ -42,7 +42,7 @@ export async function mcp<R>(input:unknown,call:(name:string,args:ToolArgs)=>Pro
   if(message.jsonrpc!=='2.0'||typeof message.method!=='string')return error(-32600,'Invalid Request');
   const p=message.params??{};
   switch(message.method){
-    case'initialize':return result({protocolVersion:'2025-06-18',capabilities:{tools:{},prompts:{}},serverInfo:{name:'spektralab',title:'SpektraLab',version:'1.3.3'},instructions});
+    case'initialize':return result({protocolVersion:'2025-06-18',capabilities:{tools:{},prompts:{}},serverInfo:{name:'spektralab',title:'SpektraLab',version:'1.3.4-win.7'},instructions});
     case'ping':return result({});
     case'tools/list':return result({tools:tools.map(({command:_command,...t})=>t)});
     case'tools/call':if(typeof p.name!=='string')return error(-32602,'tools/call needs a name');try{const a=checkTool(p.name,p.arguments??{});const r=await call(p.name,a);return result({content:await image(r),isError:false})}catch(e){return result({content:[{type:'text',text:(e instanceof Refused?'Refused: ':'Failed: ')+(e as Error).message}],isError:true})}

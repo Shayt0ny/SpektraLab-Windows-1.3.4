@@ -108,6 +108,7 @@ export interface HelloResult {
   source_formats?: PixelFormat[];
   /** Optional processed-view modes; absent means legacy film-only rendering. */
   view_options?: string[];
+  raw_decoders?: ('auto' | 'libraw' | 'candidate')[];
   /** Optional RAW preview modes; embedded-only never falls back to RAW decode. */
   thumbnail_options?: string[];
   tiff_options?: string[];
@@ -132,6 +133,8 @@ export interface ParamsSchema {
 }
 
 export interface FileMetadata {
+  raw_decoder?: string;
+  camera_curve?: { applied: boolean; profile: string; input: 'colored_raw' };
   lens_correction?: { available: boolean; applied: boolean; profile?: string; reason?: string; distortion: boolean; tca: boolean; vignetting: boolean; scale: number };
   make?: string;
   model?: string;

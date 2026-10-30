@@ -26,6 +26,7 @@
 
 #include "io/raw_decoder.hpp"
 #include "exif_fields.hpp"
+#include "core/json.hpp"
 
 namespace spkhost {
 
@@ -44,6 +45,8 @@ struct Metadata {
     std::optional<double> exposure_program, exposure_bias_ev, focal_35mm;
     ExifValues extra_exif;
     std::optional<LensCorrectionInfo> lens_correction;
+    spk::Json camera_curve;
+    std::string raw_decoder;
     int orientation = 1;   // EXIF 1..8, of the file as stored
     // RAW only: the as-shot illuminant as Temperature/Tint (white_balance.hpp).
     std::optional<double> as_shot_temperature_k, as_shot_tint;
@@ -76,9 +79,13 @@ struct Rgba8 {
 // The frame the engine develops: linear ProPhoto, orientation applied.
 struct DecodeOptions {
     std::string raw_mode = "compatible16";   // or "headroom"
+    std::string raw_decoder = "auto"; // auto | libraw | candidate
     // R2: a custom white balance at decode (RAW, both decode modes).
     std::optional<double> temperature_k, tint;
     bool lens_correction = false;
+    spk::Json lens_profile;
+    bool apply_camera_curve = false;
+    spk::Json camera_profile;
 };
 // Thrown as a plain error string prefixed "unsupported:" when a decode option
 // cannot be honoured for this file.

@@ -373,6 +373,9 @@ function PrintSection() {
         }}
       />
       <ToggleRow label={t('printEffects')} on={p.printEffects} onChange={(v) => setParams((q) => ({ ...q, printEffects: v }))} />
+      <ToggleRow label={tz('Scanner white-point correction', '扫描白点校正')} on={p.scannerWhiteCorrection} disabled={p.scanFilm || positive || p.digitalIntermediate} reason={tz('Available for paper prints.', '仅适用于相纸扫描。')} onChange={(v) => setParams((q) => ({ ...q, scannerWhiteCorrection: v }))} testId="scanner-white" />
+      <ToggleRow label={tz('Scanner black-point correction', '扫描黑点校正')} on={p.scannerBlackCorrection} disabled={p.scanFilm || positive || p.digitalIntermediate} reason={tz('Available for paper prints.', '仅适用于相纸扫描。')} onChange={(v) => setParams((q) => ({ ...q, scannerBlackCorrection: v }))} testId="scanner-black" />
+      <ScrubSlider label={tz('Scanner lens blur (px)', '扫描镜头模糊（像素）')} value={p.scannerLensBlur} range={[0, 20]} zero={0} snap={.1} format={(v) => v.toFixed(1)} disabled={!p.printEffects} onChange={(v) => setParams((q) => ({ ...q, scannerLensBlur: v }))} testId="scanner-blur" />
       <ToggleRow
         label={t('printEDR')}
         sublabel={t('statusEDRScope')}

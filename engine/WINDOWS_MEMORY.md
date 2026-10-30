@@ -1,5 +1,14 @@
 # Windows memory residency follow-up (2026-10-18)
 
+2026-10-30: compute buffers now prefer local memory, reclaim idle planes under
+pressure, then try every compatible GPU-accessible heap within its driver
+budget. This addresses small-local-heap UMA reports without disabling budget
+or commit guards. Shared allocations still run the same Vulkan kernels. The
+diagnostic compute ceiling spans all heaps; staging retains separate bounded
+transfer allocations. Heap/type/fallback logs and focused verification are
+documented in `../WINDOWS_UMA_MEMORY_FIX.md`. Radeon 780M hardware remains
+unverified locally; the shared path was exercised on the maintainer's device.
+
 This change keeps the film model, float32 processing, default effects, RAW
 algorithm/thread budget and output formats. It does not introduce overlapping
 RAW decoding, GPU renders or encoders. The public C ABI is unchanged.

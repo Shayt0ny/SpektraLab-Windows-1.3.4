@@ -90,7 +90,10 @@ bool libraw_ok(int status, const char* stage, std::string& error) {
 
 bool supported_compression(LibRaw& raw, std::string& error) {
     const char* decoder = raw.unpack_function_name();
-    if (decoder && std::strstr(decoder, "nikon_he_load_raw") != nullptr) {
+    libraw_decoder_info_t info{};
+    raw.get_decoder_info(&info);
+    if (decoder && std::strstr(decoder, "nikon_he_load_raw") != nullptr &&
+        (info.decoder_flags & LIBRAW_DECODER_UNSUPPORTED_FORMAT)) {
         const auto& model = raw.imgdata.idata.model;
         error = "RAW unpack (" +
             std::string(std::begin(model), std::find(std::begin(model), std::end(model), '\0')) +

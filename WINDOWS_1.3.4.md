@@ -1,7 +1,7 @@
 # SpektraLab Windows 1.3.4 — development notes
 
 Original project: [JamesQiu2005/SpektraLab](https://github.com/JamesQiu2005/SpektraLab).
-Windows port: [YZH2006517/SpektraLab-Windows-NANATATA](https://github.com/YZH2006517/SpektraLab-Windows-NANATATA).
+Windows port: NANATATA (historical port).
 Windows maintenance and this update: **shayt0ny**.
 Original GPL and profile/font licences and attribution are retained.
 

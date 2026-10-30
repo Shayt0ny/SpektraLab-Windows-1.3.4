@@ -8,6 +8,7 @@ add_executable(spektralab-host
     image_io.cpp
     input_formats.cpp
     lens_correction.cpp
+    raw_profile.cpp
     output.cpp
     output_codecs.cpp
     platform.cpp
@@ -22,6 +23,7 @@ target_include_directories(spektralab-host PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../src"
     "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/stb")
 target_link_libraries(spektralab-host PRIVATE spk_image_io spk_libraw spektralab_engine spektralab_core spk_codec_jpeg spk_codec_png spk_input_codecs spk_lens)
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/RawCandidate.cmake")
 if(DEFINED SPEKTRALAB_HOST_VERSION)
     target_compile_definitions(spektralab-host PRIVATE SPEKTRALAB_HOST_VERSION="${SPEKTRALAB_HOST_VERSION}")
 endif()
@@ -40,7 +42,7 @@ if(BUILD_TESTING)
     add_executable(spk_host_lens ../tests/host_lens.cpp lens_correction.cpp platform.cpp)
     target_compile_features(spk_host_lens PRIVATE cxx_std_20)
     target_include_directories(spk_host_lens PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../src")
-    target_link_libraries(spk_host_lens PRIVATE spk_lens)
+    target_link_libraries(spk_host_lens PRIVATE spk_lens spektralab_core)
     if(WIN32)
         target_link_libraries(spk_host_lens PRIVATE shell32)
     endif()
@@ -48,12 +50,23 @@ if(BUILD_TESTING)
         target_link_options(spk_host_lens PRIVATE -static)
     endif()
     add_test(NAME spk_host_lens COMMAND spk_host_lens "${CMAKE_CURRENT_BINARY_DIR}/lens-tests")
+    add_executable(spk_host_camera_curve ../tests/host_camera_curve.cpp raw_profile.cpp tiff_ifd.cpp platform.cpp)
+    target_compile_features(spk_host_camera_curve PRIVATE cxx_std_20)
+    target_include_directories(spk_host_camera_curve PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../src")
+    target_link_libraries(spk_host_camera_curve PRIVATE spektralab_core)
+    if(WIN32)
+        target_link_libraries(spk_host_camera_curve PRIVATE shell32)
+    endif()
+    if(MINGW AND SPEKTRALAB_STATIC_RUNTIME)
+        target_link_options(spk_host_camera_curve PRIVATE -static)
+    endif()
+    add_test(NAME spk_host_camera_curve COMMAND spk_host_camera_curve)
     add_executable(spk_host_inputs ../tests/host_inputs.cpp image_io.cpp input_formats.cpp lens_correction.cpp platform.cpp
         stb_impl.cpp tiff_ifd.cpp white_balance.cpp)
     target_compile_features(spk_host_inputs PRIVATE cxx_std_20)
     target_include_directories(spk_host_inputs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../src"
         "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/stb")
-    target_link_libraries(spk_host_inputs PRIVATE spk_image_io spk_libraw spk_input_codecs spk_lens)
+    target_link_libraries(spk_host_inputs PRIVATE spk_image_io spk_libraw spk_input_codecs spk_lens spektralab_core)
     if(WIN32)
         target_link_libraries(spk_host_inputs PRIVATE shell32)
     endif()

@@ -8,7 +8,7 @@ import { PillMenu, ToggleRow } from '../controls/controls';
 import { t, tz } from '../i18n';
 import { host } from '../host/client';
 import { platform, type AppPaths } from '../platform';
-import { recomputeFilmFormat, requestPrint, setPages, useSession, sessionStore } from '../state/session';
+import { recomputeFilmFormat, requestPrint, setPages, useSession, sessionStore, setRawDecoder } from '../state/session';
 import { INTERFACE_SCALES, PREVIEW_EDGES, settingsStore, useSettings, SETTINGS_DEFAULT } from '../state/settings';
 import { featureGate } from '@shared/params';
 import { AgentsSettings, MemorySettings, UpdateSettings } from './SettingsPages';
@@ -43,6 +43,8 @@ export function SettingsDialog() {
   const st = useSettings((s) => s);
   const hello = useSession((s) => s.hello);
   const hostState = useSession((s) => s.hostState);
+  const batch = useSession((s) => s.batchExporting);
+  const rawDecoderUsed = useSession((s) => s.metadata?.raw_decoder);
   const gate = useSessionGate();
   const [paths, setPaths] = useState<AppPaths | null>(null);
   const [diag, setDiag] = useState<string>('');
@@ -104,6 +106,17 @@ export function SettingsDialog() {
         )}
         {page === 'rendering' && (
           <>
+            <div className="settings-group">
+              <h3>{tz('RAW decoder', 'RAW 解码器')}</h3>
+              <PillMenu label={tz('RAW decoder', 'RAW 解码器')} value={st.rawDecoder}
+                testId="raw-decoder" disabled={batch || !hello?.raw_decoders}
+                options={[{ value: 'auto', label: tz('Automatic', '自动') },
+                  { value: 'libraw', label: 'LibRaw 0.22.2' }, { value: 'candidate', label: tz('Candidate decoder', '候选解码器') }]}
+                onChange={setRawDecoder} />
+              <div className="caption">{tz('Automatic tries LibRaw first, then the bundled candidate on failure. Candidate includes Nikon HE/HE★ support; unsupported files still report an error. Changes apply to the current RAW and subsequent opens.',
+                '自动：先使用 LibRaw，失败后尝试内置候选解码器。候选版含尼康 HE／HE★ 支持；仍不支持的文件会显示具体原因。修改后重新解码当前 RAW，并用于之后打开的照片。')}</div>
+              {rawDecoderUsed && <div className="caption">{tz('Current: ', '当前使用：')}{rawDecoderUsed}</div>}
+            </div>
             <div className="settings-group">
               <h3>{tz('Preview', '预览')}</h3>
               <PillMenu
@@ -232,7 +245,7 @@ export function AboutDialog() {
     if (!open) return;
     void platform().appPaths().then(setPaths);
     void Promise.all(
-      ['SpektraLab-GPL-3.0.txt', 'Profiles-and-LUTs-CC-BY-SA-4.0.txt', 'README.txt'].map(async (name) => {
+      ['SpektraLab-GPL-3.0.txt', 'Profiles-and-LUTs-CC-BY-SA-4.0.txt', 'README.txt', 'RawTherapee-NOTICE.txt', 'Nikon-HE-NOTICE.txt'].map(async (name) => {
         try {
           const r = await fetch('assets/licenses/' + name);
           return { name, body: r.ok ? await r.text() : '' };
@@ -248,6 +261,13 @@ export function AboutDialog() {
         <p>
           {tz('Version', '版本')} {paths?.version ?? '1.3.4'} — {tz('film and print emulation built on the spektrafilm engine.', '基于 spektrafilm 引擎的胶片与相纸模拟。')}
         </p>
+        <p className="caption">
+          {tz('Windows maintenance: shayt0ny.', 'Windows 维护：shayt0ny。')}
+        </p>
+        <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn" onClick={() => void platform().openUrl('https://github.com/andreavolpato/spektrafilm')}>Andrea Volpato · spektrafilm</button>
+          <button className="btn" onClick={() => void platform().openUrl('https://github.com/JamesQiu2005/SpektraLab')}>JamesQiu2005 · SpektraLab</button>
+        </div>
         <p className="caption">
           {tz(
             'SpektraLab is free software under the GNU GPL, version 3 or later. The film and paper profiles are licensed CC BY-SA 4.0; their attribution follows.',

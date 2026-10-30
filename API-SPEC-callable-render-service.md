@@ -1,5 +1,18 @@
 # API Spec — Callable Render Service (implementation reference)
 
+Windows host extension, 2026-10-31: RAW decoder policy (`auto`, `libraw`,
+`candidate`) is a host decode option, recorded with the frozen source snapshot.
+It never crosses the film/paper parameter surface; see desktop/HOST-PROTOCOL.md.
+
+Windows host extension, 2026-10-30: optional camera-curve processing and
+imported LCPs are **host decode options**, not material-model parameters or
+new `spk_set_params` keys. `apply_camera_curve` defaults false; an enabled
+DCP transforms the owned linear-ProPhoto decode before `spk_open`, whose
+input is then `colored_raw`. The public C ABI and measured profiles are
+unchanged. Request/response shapes, capability negotiation, frozen export
+semantics and limits are specified in `desktop/HOST-PROTOCOL.md`, “Camera
+curve and imported LCP extensions”.
+
 | | |
 |---|---|
 | **Status** | Reference for implementation. Not a rewrite of the engine — see `PRD-callable-render-api.md` for product rationale, this doc for exact call sequences. |

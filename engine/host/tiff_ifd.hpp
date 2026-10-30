@@ -13,7 +13,7 @@ class TiffBytes {
 public:
     TiffBytes(const uint8_t* data, size_t size) : d_(data), n_(size) {}
     // Reads the header; false when the bytes are not classic TIFF.
-    bool header(uint32_t& first_ifd);
+    bool header(uint32_t& first_ifd, bool camera_profile = false);
     bool little() const { return little_; }
     uint16_t u16(size_t at) const;
     uint32_t u32(size_t at) const;

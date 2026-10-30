@@ -64,6 +64,15 @@ int main(int argc,char**argv) {
         auto bad=original;bad.raw_metadata->camera_to_output.fill(0);
         require(!correct_lens(bad,p,error)&&bad.rgb==original.rgb,"singular camera transform rejected before pixel writes");
         bad=original;bad.rgb.resize(10);require(!correct_lens(bad,p,error),"invalid dimensions rejected");
+        spk::Json lcp;std::string json_error;
+        require(spk::Json::parse(R"({"version":1,"name":"Owned calibration.lcp","raw":true,"entries":[{"focal":50,"aperture":4,"distance":1000,"crop":1,"fisheye":false,"base":{"fx":1,"fy":1,"cx":0.49,"cy":0.51,"scale":1,"k":[0.15,0,0,0,0]}}]})",lcp,json_error),"LCP fixture parse");
+        auto corrected=original;auto lcp_probe=p;lcp_probe.metadata.lens="Uncatalogued";
+        require(correct_lens(corrected,lcp_probe,error,lcp),error.c_str());
+        require(corrected.rgb!=original.rgb&&lcp_probe.metadata.lens_correction->scale>1,"imported LCP must warp pixels and crop borders even without a database match");
+        require(lcp_probe.metadata.lens_correction->applied,"LCP application status");
+        for(int o=1;o<=8;++o){auto input=oriented(original,o),expected=oriented(corrected,o);auto probe=p;probe.width=input.width;probe.height=input.height;probe.metadata.orientation=o;
+            require(correct_lens(input,probe,error,lcp),error.c_str());for(size_t i=0;i<input.rgb.size();++i)require(std::abs(input.rgb[i]-expected.rgb[i])<2e-5f,"LCP sensor-axis orientation equivariance");}
+        lcp.set("raw",spk::Json(false));bad=original;require(!correct_lens(bad,p,error,lcp)&&bad.rgb==original.rgb,"JPEG LCP rejected for RAW");
         std::cout<<"lens matching, EXIF distance, TCA colour transform, float range, 8 orientations and rejection passed\n";
         return 0;
     }catch(const std::exception&e){std::cerr<<e.what()<<'\n';return 1;}

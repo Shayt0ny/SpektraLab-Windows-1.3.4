@@ -10,6 +10,9 @@
 import { type Adjustments, ADJUSTMENTS_DEFAULT, decodeAdjustments } from './adjustments.ts';
 import { type Geometry, GEOMETRY_DEFAULT, decodeGeometry, encodeGeometry } from './geometry.ts';
 import { type FilmParams, FILM_PARAMS_DEFAULT, decodeFilmParams } from './params.ts';
+import type { LensCalibrationProfile } from './lensProfile.ts';
+import type { CameraCurveConfiguration } from './rawDevelopment.ts';
+export type RawDecoder = 'auto' | 'libraw' | 'candidate';
 
 export type FrameState = 'unprocessed' | 'processed' | 'stale';
 
@@ -18,12 +21,17 @@ export interface DecodeSettings {
   temperature: number;
   tint: number;
   lensCorrection: boolean;
+  lensProfile?: LensCalibrationProfile;
+  apply_camera_curve?: boolean;
+  cameraCurve?: CameraCurveConfiguration;
+  rawDecoder?: RawDecoder;
 }
 export const DECODE_DEFAULT: DecodeSettings = {
   whiteBalance: 'As Shot',
   temperature: 5500,
   tint: 0,
   lensCorrection: false,
+  apply_camera_curve: false,
 };
 
 export interface Sidecar {
@@ -84,6 +92,10 @@ export function decodeSidecar(raw: unknown): Sidecar {
       temperature: typeof d.temperature === 'number' ? d.temperature : DECODE_DEFAULT.temperature,
       tint: typeof d.tint === 'number' ? d.tint : DECODE_DEFAULT.tint,
       lensCorrection: d.lensCorrection === true,
+      ...(d.lensProfile && typeof d.lensProfile === 'object' ? { lensProfile: d.lensProfile as LensCalibrationProfile } : {}),
+      apply_camera_curve: d.apply_camera_curve === true,
+      ...(['auto', 'libraw', 'candidate'].includes(String(d.rawDecoder)) ? { rawDecoder: d.rawDecoder as RawDecoder } : {}),
+      ...(d.cameraCurve && typeof d.cameraCurve === 'object' ? { cameraCurve: d.cameraCurve as CameraCurveConfiguration } : {}),
     },
     params: o.params ? decodeFilmParams(o.params) : FILM_PARAMS_DEFAULT,
     adjustments: o.adjustments ? decodeAdjustments(o.adjustments) : ADJUSTMENTS_DEFAULT,

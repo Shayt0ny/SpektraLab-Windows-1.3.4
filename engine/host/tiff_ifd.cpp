@@ -8,12 +8,12 @@
 
 namespace spkhost {
 
-bool TiffBytes::header(uint32_t& first_ifd) {
+bool TiffBytes::header(uint32_t& first_ifd, bool camera_profile) {
     if (n_ < 8) return false;
     if (d_[0] == 'I' && d_[1] == 'I') little_ = true;
     else if (d_[0] == 'M' && d_[1] == 'M') little_ = false;
     else return false;
-    if (u16(2) != 42) return false;
+    if (u16(2) != 42 && !(camera_profile && u16(2) == 0x4352)) return false;
     first_ifd = u32(4);
     return true;
 }

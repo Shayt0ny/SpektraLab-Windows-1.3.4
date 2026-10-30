@@ -38,12 +38,12 @@ test('keeps 16-bit samples until drawing and reports the actual browser buffer',
     gl.getExtension('WEBGL_lose_context')?.loseContext(); canvas.remove();
     return capabilities;
   });
+  console.log('Actual preview precision:', JSON.stringify(measured));
   expect(measured.error).toBe(0);
   expect(measured.glError).toBe(0);
   expect(measured.sample).toBe(0);
   if (measured.precision === 'float16') expect(measured.steps).toBeGreaterThan(50);
   else expect(measured.precision).toBe('unorm8');
-  console.log('Actual preview precision:', JSON.stringify(measured));
   await testInfo.attach('actual-browser-preview-precision', {body:JSON.stringify(measured,null,2),contentType:'application/json'});
 });
 

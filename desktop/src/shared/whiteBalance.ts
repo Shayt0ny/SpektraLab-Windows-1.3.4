@@ -15,6 +15,7 @@
 // unticked and do nothing.
 
 import type { DecodeSettings } from './sidecar.ts';
+import type { CameraProfile } from './rawDevelopment.ts';
 import { RAW_EXTENSIONS } from './fileTypes.ts';
 
 export type WhiteBalanceMode = 'As Shot' | 'Daylight' | 'Cloudy' | 'Shade' | 'Tungsten' | 'Fluorescent' | 'Custom';
@@ -91,14 +92,19 @@ export function isRawPath(path: string): boolean {
 }
 
 export interface WireDecode {
+  raw_decoder?: DecodeSettings['rawDecoder'];
   white_balance: { mode: 'as_shot' } | { mode: 'custom'; temperature_k: number; tint: number };
   lens_correction?: boolean;
+  lens_profile?: DecodeSettings['lensProfile'];
+  apply_camera_curve?: boolean;
+  camera_profile?: CameraProfile;
 }
 
 /** `open.decode` / `redecode.decode` for a RAW; null for anything else (the host refuses it there). */
 export function decodeWire(d: DecodeSettings, isRaw: boolean): WireDecode | null {
   if (!isRaw) return null;
-  const lens = d.lensCorrection ? { lens_correction: true } : {};
+  const lens = { ...(d.rawDecoder ? { raw_decoder: d.rawDecoder } : {}), ...(d.lensCorrection ? { lens_correction: true, ...(d.lensProfile ? { lens_profile: d.lensProfile } : {}) } : {}),
+    ...(d.apply_camera_curve ? { apply_camera_curve: true, ...(d.cameraCurve?.profile ? { camera_profile: d.cameraCurve.profile } : {}) } : {}) };
   if (modeOf(d) === 'As Shot') return { white_balance: { mode: 'as_shot' }, ...lens };
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
   return { white_balance: { mode: 'custom', temperature_k: clamp(d.temperature, 2000, 50000), tint: clamp(d.tint, -150, 150) }, ...lens };
