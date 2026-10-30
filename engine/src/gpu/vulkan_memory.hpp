@@ -1,3 +1,5 @@
+// Copyright (C) 2026 shayt0ny. SPDX-License-Identifier: GPL-3.0-or-later
+// Windows integration code; imported data retains its separate notices.
 #pragma once
 #include <vulkan/vulkan_core.h>
 #include <algorithm>

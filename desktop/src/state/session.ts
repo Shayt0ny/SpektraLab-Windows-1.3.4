@@ -37,6 +37,7 @@ import { type HalfFramePair, type PairHole, type PairLayer, type PairPlacement, 
   decodePair, encodePair, isPairPath, newHole, newPair, pairFilmFormat, pairRects, pairFitRegion, pairSnapshotFor, pairWithMeterReadings, printTrim, resolvePairParams } from '@shared/pair';
 import { type DecodeSettings, type Sidecar, decodeSidecar, encodeSidecar, newSidecar } from '@shared/sidecar';
 import { decodeWire, isRawPath, modeOf } from '@shared/whiteBalance';
+import { addsClipping, autoToneBaseline, autoToneProposal, insetAutoRegion, saferAutoTone, toneStatistics, type AutoRegion } from '@shared/autoAdjust';
 import { type ClipboardGroup, type SettingsClip, CLIPBOARD_GROUPS, applyClip, clipChanges } from '@shared/clipboard';
 import { EMPTY_CATALOG, type StockCatalog, loadCatalog } from '@shared/stocks';
 import { type LatitudeReply, type PlacementIssue, type PlacementSide, type PlacementWindow,
@@ -115,6 +116,8 @@ export interface SessionState {
   imageVersion: number;
   badge: Tier | null;
   developing: boolean;
+  autoAdjusting: boolean;
+  autoAdjustMessage: string;
   status: string;
   lastError: string | null;
   /** Disk edits never silently replace unsaved edits in the current editor. */
@@ -170,6 +173,8 @@ const INITIAL: SessionState = {
   imageVersion: 0,
   badge: null,
   developing: false,
+  autoAdjusting: false,
+  autoAdjustMessage: '',
   status: '',
   lastError: null,
   externalEditConflict: false,
@@ -212,6 +217,7 @@ const pairHoleGeneration = { left: 0, right: 0 };
 let pairDecodeSave: Promise<void> = Promise.resolve();
 let openingTask: Promise<void> = Promise.resolve();
 let liveDisplayKey: { session: string; key: string } | null = null;
+let autoAdjustToken = 0;
 let previewIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
 const cameraDescriptor = (path: string): DisplayCacheDescriptor => ({ kind: 'original', sources: [path],
@@ -903,9 +909,86 @@ export function setAdjustments(fn: (a: Adjustments) => Adjustments) {
   const next = fn(s.sidecar.adjustments);
   if (jsonEqual(next, s.sidecar.adjustments)) return;
   pushUndo();
-  set({ sidecar: { ...s.sidecar, adjustments: next } });
+  set({ sidecar: { ...s.sidecar, adjustments: next }, autoAdjustMessage: '' });
   scheduleSave();
   if (hostViews() && !s.batchExporting) void requestPrint();
+}
+
+// Automatic Post-Dev orchestration, Copyright (C) 2026 shayt0ny.
+// Measured film/paper data and RAW decode settings are never modified here.
+export function canAutoAdjust(): boolean {
+  const s = get();
+  return !!s.selection && !!s.engineSession && !!s.badge && !!frameImages.print && hostViews()
+    && !s.batchExporting && !s.developing && !s.redecoding && !decodeTimer && !s.decodeError && !s.autoAdjusting
+    && !s.pairPlacing && (s.tool === 'select' || s.tool === 'hand')
+    && (!s.pair || s.pairLayer === 'film' && !!s.pairInfo?.left?.available && !!s.pairInfo?.right?.available)
+    // UI-only choices can differ while their effective wire values are the
+    // same. Use the renderer's delta contract, not whole-model equality.
+    && !!sentParams && Object.keys(paramsDelta(s.sidecar.params,sentParams,s.gate,s.catalog).delta).length === 0;
+}
+
+function autoAdjustmentStamp(s: SessionState): string {
+  return JSON.stringify([s.engineSession,s.selection,s.sidecar.params,s.sidecar.adjustments,s.sidecar.geometry,
+    s.sidecar.decode,s.sidecar.noFilm,s.pair,s.pairLayer,s.tool]);
+}
+
+export async function autoAdjust(): Promise<void> {
+  if (!canAutoAdjust()) return;
+  const snapshot = get(), sid = snapshot.engineSession!, stamp = autoAdjustmentStamp(snapshot);
+  const token = ++autoAdjustToken;
+  const current = () => autoAdjustToken === token && !get().batchExporting && !get().redecoding
+    && !decodeTimer && autoAdjustmentStamp(get()) === stamp;
+  foregroundWork(); if (fullTimer) clearTimeout(fullTimer);
+  set({ autoAdjusting:true, autoAdjustMessage:'' });
+  try {
+    const baseline = autoToneBaseline(snapshot.sidecar.adjustments);
+    const options = { geometry:canvasGeometryFor(snapshot.sidecar.params,snapshot.sidecar.geometry,snapshot.gate,snapshot.sidecar.noFilm),
+      source_geometry:sourceGeometryFor(snapshot.sidecar.params,snapshot.sidecar.geometry,snapshot.gate,snapshot.sidecar.noFilm) ?? GEOMETRY_DEFAULT,
+      ...(snapshot.sidecar.noFilm ? { no_film:true } : {}), display:'srgb' as const,
+      generation:1_000_000_000+token, long_edge:512 };
+    const measure = (adjustments: Adjustments) => host().renderView(sid,'live',{...options,adjustments});
+    const image = await measure(baseline);
+    if (!current()) return;
+    let regions: AutoRegion[] | undefined;
+    if (edgeEffective(snapshot.sidecar.params.filmEdge,snapshot.gate,snapshot.sidecar.noFilm)) {
+      const layout = await host().overscanGeometry(sid);
+      if (!current()) return;
+      if (!layout.valid || !layout.gates?.length) throw new Error(tz('Picture boundaries are not ready; retry after the preview finishes.', '画面范围尚未准备完成，请等待预览后重试。'));
+      regions = layout.gates.map((gate) => {
+        if (gate.length !== 8) throw new Error('Invalid film gate geometry');
+        return insetAutoRegion(Array.from({length:4},(_,i) => [gate[i*2]!,gate[i*2+1]!] as const));
+      });
+    } else if (snapshot.pair) {
+      if (!snapshot.pairInfo?.gates?.length) throw new Error(tz('Pair picture boundaries are not ready.', '拼接画面范围尚未准备完成。'));
+      regions = snapshot.pairInfo.gates.map(({x,y,width,height}) => insetAutoRegion([[x,y],[x+width,y],[x+width,y+height],[x,y+height]]));
+    }
+    const before = toneStatistics(image,regions);
+    let patch = autoToneProposal(before);
+    if (!patch) {
+      set({ autoAdjustMessage:tz('Not enough tonal variation to adjust safely.', '画面层次不足，已保留当前调整。') }); return;
+    }
+    let result = await measure({...baseline,...patch});
+    if (!current()) return;
+    if (addsClipping(before,toneStatistics(result,regions))) {
+      patch = saferAutoTone(patch);
+      result = await measure({...baseline,...patch});
+      if (!current()) return;
+      if (addsClipping(before,toneStatistics(result,regions))) {
+        set({autoAdjustMessage:tz('Automatic adjustment would add clipping; current edits were kept.', '自动调整会增加高光或阴影截断，已保留当前调整。')}); return;
+      }
+    }
+    if (!current()) return;
+    lastUndoAt = -Infinity; // One deliberate action, never merged into a drag.
+    const committed = patch;
+    setAdjustments((a) => ({...a,enabled:true,...committed}));
+    set({autoAdjustMessage:tz('Auto applied. Refine the sliders or undo with Ctrl+Z.', '已自动调整；可继续微调，或按 Ctrl+Z 撤销。')});
+    platform().log('info',`auto_adjust: ${JSON.stringify({owner:'shayt0ny',version:1,samples:before.count,patch})}`);
+  } catch (e) {
+    if (current()) noteError(tz('Automatic adjustment','自动调整'),e);
+  } finally {
+    if (autoAdjustToken === token) set({autoAdjusting:false});
+    resumePreviewsWhenIdle();
+  }
 }
 
 /** Draft crop edits draw locally; committed geometry refreshes the GPU view. */
@@ -1619,6 +1702,8 @@ export function saveFrameOrder() {
 }
 
 async function closeEngineSession() {
+  autoAdjustToken++;
+  set({autoAdjusting:false,autoAdjustMessage:''});
   const sid = get().engineSession;
   set({ engineSession: null });
   sentParams = null;

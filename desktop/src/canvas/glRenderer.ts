@@ -1,3 +1,4 @@
+// Windows 16-bit display precision and context-recovery changes, Copyright (C) 2026 shayt0ny. Modified 2026-10-31.
 // glRenderer.ts — the canvas, in WebGL2 (the Mac's `Canvas/Renderer.swift`
 // + `canvasFragment` and `layer2` in Shaders.metal, folded into one pass).
 //

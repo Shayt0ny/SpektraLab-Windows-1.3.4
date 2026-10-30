@@ -1,3 +1,5 @@
+// Copyright (C) 2026 shayt0ny. SPDX-License-Identifier: GPL-3.0-or-later
+// Windows integration code; imported data retains its separate notices.
 import { useRef, useState } from 'react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { host } from '../host/client';

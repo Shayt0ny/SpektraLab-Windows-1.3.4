@@ -1,3 +1,5 @@
+// Copyright (C) 2026 shayt0ny. SPDX-License-Identifier: GPL-3.0-or-later
+// Windows integration code; imported data retains its separate notices.
 // Portable, frozen LCP calibration. Sidecars retain the numbers used by export;
 // changing/removing the library copy never changes an existing photograph.
 export const LCP_MAX_BYTES = 8 * 1024 * 1024;

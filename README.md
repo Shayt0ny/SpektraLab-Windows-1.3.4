@@ -1,4 +1,4 @@
-# SpektraLab Windows 1.3.4-win.7 · shayt0ny
+# SpektraLab Windows 1.3.4-win.8 · shayt0ny
 
 胶片模拟软件 SpektraLab 的 **Windows 维护分支**。项目起源于 macOS，现在已有官方 Windows 测试版；本分支在此基础上整合兼容性修复与导入流程改进。打开 RAW 照片、选择胶片和相纸，模拟真实冲印过程。
 
@@ -10,6 +10,10 @@
 [发布说明](RELEASE_NOTES_1.3.4_zh-CN.md)。
 本次 Windows 修订新增 Z5 II 白平衡兼容、缩小预览颗粒滤波和选择照片导入，
 详情及尚未确认的问题见 [Windows 修订说明](WINDOWS_1.3.4_R2_NOTES.md)。
+
+**win.8 新增：** 显影后“一键自动调整”，保守调整七个调色参数，支持整体撤销与导出；
+新增代码与 Windows 修改保留 shayt0ny 的范围署名。详见
+[win.8 说明](WINDOWS_1.3.4_R8_NOTES.md)与[Windows 署名](AUTHORS_WINDOWS.md)。
 
 **win.7 整合更新：** 原图界面新增默认关闭的“机内曲线色彩”，可读取本机或导入的 DCP，
 在胶片渲染前生成 `colored_raw`。自定义 RAW `.lcp` 现已实际作用于像素并自动裁边，

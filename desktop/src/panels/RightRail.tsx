@@ -3,6 +3,7 @@
 //   Post-Dev: White Balance · Exposure · Curve · Color Balance (Layer 2)
 
 import { useRef, useState } from 'react';
+import { autoAdjust, canAutoAdjust } from '../state/session';
 import { Checkbox, NumberField, PillMenu, ScrubSlider, Section, SegmentedSwitch, ToggleRow, signed } from '../controls/controls';
 import { isChinese, t, tz } from '../i18n';
 import { cameraParams, pairFocus, setCamera, shownAdjustments, shownDecode as selectedDecode, updatePair, canPickNeutral, currentPlacementWindow, hostRedecodes, placeScene, placementReady, resetScenePlacement, setAdjustments, setDecode, setFilmFrame, setFilmSide, setParams, setSideLengthMM, startNeutralPick, useSession } from '../state/session';
@@ -416,6 +417,9 @@ function WhiteBalanceSection() {
 
 function ExposureSection() {
   const a = useSession(shownAdjustments);
+  const autoReady = useSession(() => canAutoAdjust());
+  const autoBusy = useSession((s) => s.autoAdjusting);
+  const autoMessage = useSession((s) => s.autoAdjustMessage);
   const row = (label: string, key: 'exposure' | 'contrast' | 'brightness' | 'saturation' | 'highlights' | 'shadows' | 'blackPoint' | 'whitePoint', range: [number, number], digits: number, snap: number) => (
     <ScrubSlider key={key} label={label} value={a[key]} range={range} snap={snap} format={signed(digits)} onChange={(v) => setAdjustments((q) => ({ ...q, [key]: v }))} testId={'adj-' + key} />
   );
@@ -426,6 +430,11 @@ function ExposureSection() {
       onReset={() => setAdjustments((q) => ({ ...q, exposure: 0, contrast: 0, brightness: 0, saturation: 0, highlights: 0, shadows: 0, blackPoint: 0, whitePoint: 0 }))}
       resetHelp={t('helpReset')}
     >
+      {/* Automatic adjustment controls Copyright (C) 2026 shayt0ny. */}
+      <button className="btn" style={{width:'100%',marginBottom:6}} data-testid="auto-adjust" disabled={!autoReady}
+        title={tz('Suggest a conservative starting point. Keeps RAW white balance and film settings; Ctrl+Z undoes the whole action.', '生成保守的调色起点；保留 RAW 白平衡和胶片设置，Ctrl+Z 可整体撤销。')}
+        onClick={() => void autoAdjust()}>{autoBusy ? tz('Analyzing…','正在分析…') : tz('Auto adjust','一键自动调整')}</button>
+      {autoMessage && <div className="caption" role="status" data-testid="auto-adjust-message">{autoMessage}</div>}
       {row(t('clipExposure'), 'exposure', [-3, 3], 2, 1 / 4)}
       {row(t('exposureContrast'), 'contrast', [-50, 50], 0, 5)}
       {row(t('exposureBrightness'), 'brightness', [-50, 50], 0, 5)}

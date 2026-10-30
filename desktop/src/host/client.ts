@@ -165,6 +165,10 @@ export class Host {
   async sceneLatitude(session: string, request: Record<string, unknown>, snapshot?: { params?: WireParams; source_geometry?: Geometry }): Promise<Record<string, unknown>> {
     return (await this.call<Record<string, unknown>>('scene_latitude', { session, request, ...snapshot })).result;
   }
+  /** Existing engine layout, read-only. Used to meter picture gates without rebate. */
+  async overscanGeometry(session: string): Promise<{ valid: boolean; gates?: number[][] }> {
+    return (await this.call<{ valid: boolean; gates?: number[][] }>('overscan_geometry', { session })).result;
+  }
 
   async renderView(session: string, tier: Tier, opts: {
     adjustments: Adjustments; geometry: Geometry; display: 'srgb' | 'display-p3'; generation: number; long_edge?: number;

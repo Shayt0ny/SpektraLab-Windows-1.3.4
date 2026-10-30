@@ -1,3 +1,4 @@
+// Windows missing-camera compatibility adapter (camera data retains separate notices), Copyright (C) 2026 shayt0ny. Modified 2026-10-31.
 #pragma once
 
 #include "raw_camera.hpp"

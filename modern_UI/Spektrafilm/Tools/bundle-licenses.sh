@@ -60,13 +60,27 @@ Canonical source: https://github.com/andreavolpato/spektrafilm
 Licence:          CC BY-SA 4.0
 
 
-The 28 film and paper profiles  --  UNMODIFIED
-----------------------------------------------
+The 28 upstream film and paper profiles  --  ORIGINAL ARRAYS PRESERVED
+--------------------------------------------------------------------
 
-`Resources/engine/profiles/*.json` are byte-for-byte copies of
-`src/spektrafilm/data/profiles/*.json` from the upstream project. Nothing in
-this application edits them; `engine/tools/bake_resources.py` copies them and
-`engine/src/core/profile.cpp` reads them.
+Source: andreavolpato/spektrafilm, commit
+3bb2c2d2801ff68b92019cf1dbcbb133d60832bc.
+
+The original profile contents are preserved, with these file-level notes:
+
+  - 20 profiles have identical parsed JSON; checkout line endings can differ.
+  - 8 paper profiles additionally contain SpektraLab's data.edr_tone_map:
+    fujifilm_crystal_archive_typeii, kodak_2383, kodak_2393,
+    kodak_ektacolor_edge, kodak_endura_premier, kodak_portra_endura,
+    kodak_supra_endura and kodak_ultra_endura.
+  - Removing only that additional output-calibration field leaves all 28
+    profiles identical in parsed content to the upstream versions. Original
+    sensitivity, density, dye and layer arrays were not changed.
+
+The EDR additions were inherited from SpektraLab's Windows beta, not newly
+fitted by shayt0ny. They are output extensions, not Andrea Volpato's original
+measurement data. This 2026-10-30 documentation correction does not modify
+the profile arrays, their licence, or the existing released archives.
 
 
 The 8 baked print-preview LUTs  --  DERIVED

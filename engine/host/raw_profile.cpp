@@ -1,3 +1,5 @@
+// Copyright (C) 2026 shayt0ny. SPDX-License-Identifier: GPL-3.0-or-later
+// Windows integration code; imported data retains its separate notices.
 #include "raw_profile.hpp"
 #include "tiff_ifd.hpp"
 #include "platform.hpp"

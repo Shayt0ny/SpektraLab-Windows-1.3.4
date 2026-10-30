@@ -1,3 +1,5 @@
+// Copyright (C) 2026 shayt0ny. SPDX-License-Identifier: GPL-3.0-or-later
+// Windows integration code; imported data retains its separate notices.
 import type { RgbaImage } from '../host/client';
 
 /** Only the display copy is bounded during GPU recovery. Area-average exact

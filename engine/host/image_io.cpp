@@ -1,3 +1,4 @@
+// Windows decoder selection and imported LCP integration, Copyright (C) 2026 shayt0ny. Modified 2026-10-31.
 #include "image_io.hpp"
 #include "input_formats.hpp"
 #include "lens_correction.hpp"

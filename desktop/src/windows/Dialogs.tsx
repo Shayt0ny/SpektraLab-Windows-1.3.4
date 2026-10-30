@@ -262,7 +262,7 @@ export function AboutDialog() {
           {tz('Version', '版本')} {paths?.version ?? '1.3.4'} — {tz('film and print emulation built on the spektrafilm engine.', '基于 spektrafilm 引擎的胶片与相纸模拟。')}
         </p>
         <p className="caption">
-          {tz('Windows maintenance: shayt0ny.', 'Windows 维护：shayt0ny。')}
+          {tz('Windows maintenance and automatic adjustment: shayt0ny.', 'Windows 维护与自动调整：shayt0ny。')}
         </p>
         <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
           <button className="btn" onClick={() => void platform().openUrl('https://github.com/andreavolpato/spektrafilm')}>Andrea Volpato · spektrafilm</button>

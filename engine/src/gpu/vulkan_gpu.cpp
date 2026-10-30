@@ -1,3 +1,4 @@
+// Windows compatible-heap memory allocation changes, Copyright (C) 2026 shayt0ny. Modified 2026-10-31.
 // vulkan_gpu.cpp -- synchronous Vulkan compute with explicit host transfers.
 //
 // Compute planes prefer device-local memory, with compatible system-heap
