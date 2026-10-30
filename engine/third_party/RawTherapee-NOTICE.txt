@@ -1,0 +1,16 @@
+RawTherapee-derived DCP default tone table
+
+engine/host/raw_profile_curve.inc contains the default DCP tone table from:
+https://github.com/RawTherapee/RawTherapee/blob/dev/rtengine/dcp.cc
+The source URL and original copyright are also recorded in raw_profile_curve.inc.
+Copyright (c) 2012 Oliver Duis <www.oliverduis.de>
+License: GNU General Public License, version 3 or (at your option) any later version.
+See SpektraLab-GPL-3.0.txt / license/LICENSE for the full license text.
+
+The LCP camera model implementation was cross-checked against RawTherapee's
+rtengine/lcp.cc and Lensfun's lensfun-convert-lcp. It retains calibrated focal
+normalization and image centres and operates before film simulation.
+
+No Adobe DCP, XMP, or LCP file is distributed. Installed/imported profiles
+remain user-supplied data. DCP development does not claim to reproduce Nikon
+Picture Control or Lightroom's Adobe Color exactly.

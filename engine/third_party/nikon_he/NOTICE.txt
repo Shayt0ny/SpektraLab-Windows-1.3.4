@@ -1,0 +1,32 @@
+Nikon HE / HE* RAW decoder extension, LGPL-2.1 option
+
+Pinned candidate source from pdcgomes/redlamp-libraw:
+https://github.com/pdcgomes/redlamp-libraw/tree/f4956c404fba0c6035ce9e06353d4b4ffe068fc7
+Archive SHA256: 316b25600f0d8cc00518464f5558060beb756ffa7fa619a02a0bbe877bf8686e
+The complete source is built as an isolated candidate module. The host's
+ordinary LibRaw 0.22.2 archive remains separate and unchanged.
+
+Copyright (C) 2026 Dmitri Sotnikov, Jiang Yaogeng and other authors named
+in the individual source headers. The upstream public implementation is
+LibRaw PR 826 (yogthos, head 499bfd4cbf802c2fb5eac4c9a6f53bbeb776cad1).
+https://github.com/LibRaw/LibRaw/pull/826
+
+This pin includes RdWing's bottom-edge, lookup-bound, exact integer transfer
+and raw-GCLI fixes, and Redlamp contributors' reentrancy, geometry and
+malformed-stream checks. Preserve every source's authorship and licence.
+LibRaw offers LGPL-2.1 or CDDL-1.0; this build selects LGPL-2.1 (LICENSE.LGPL).
+
+SpektraLab integration, 2026-10-31, shayt0ny:
+engine/cmake/RawCandidate.cmake builds the pinned source into an isolated
+module. Auto tries stable LibRaw 0.22.2 first, then the candidate on RAW
+decode failure. Strict libraw/candidate modes are also available. The
+candidate routes MakerNote NEFCompression 13/14 plus the JPEG XS signature
+to the HE decoder. Both backends use the app's same linear ProPhoto decode
+contract; film/paper models and the spectral pipeline are unchanged.
+The candidate is not an official LibRaw release. Unsupported headers fail
+explicitly; no embedded JPEG is substituted as editable RAW.
+
+samples.json and goldens.json retain Redlamp's reproducible decoder bench
+references. Photographs are not included here or in the release package.
+Raw.pixls.us samples are CC0; the separately identified Play Raw sample is
+CC BY-SA 4.0 with attribution in samples.json.

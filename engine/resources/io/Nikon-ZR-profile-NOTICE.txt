@@ -1,0 +1,16 @@
+Nikon ZR (LibRaw normalized model ZR) D65 colour matrix
+
+Source: RawSpeed contributors, darktable-org/rawspeed, data/cameras.xml
+Pinned commit: c48d5a6227a1369b633b86bc6707cb0e11d2150b
+https://github.com/darktable-org/rawspeed/blob/c48d5a6227a1369b633b86bc6707cb0e11d2150b/data/cameras.xml
+Entry: NIKON CORPORATION / NIKON ZR / 14bit-compressed
+Rows: 11206 -4286 -941; -4879 12847 2251; -745 1654 7374
+Scale: 10000, XYZ to camera under D65.
+
+Creative Commons Attribution-ShareAlike 3.0 Unported (cameras.xml).
+https://creativecommons.org/licenses/by-sa/3.0/
+The nine coefficients are reused unchanged. Sensor levels and crop are not
+copied; the file and LibRaw retain control of those values.
+
+SpektraLab Windows maintenance: shayt0ny. Used only for an exact ZR match
+when no camera/file matrix is present. Existing calibrations take precedence.
