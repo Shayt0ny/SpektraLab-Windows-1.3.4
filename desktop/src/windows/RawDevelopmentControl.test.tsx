@@ -2,10 +2,11 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { newSidecar } from '@shared/sidecar';
-const fake = vi.hoisted(() => ({ state: {} as any, cameraProfile: vi.fn(), setDecode: vi.fn() }));
-vi.mock('../state/session', () => ({ useSession: (f: (s: any) => unknown) => f(fake.state),
-  sessionStore: { getState: () => fake.state }, setDecode: (f: (d: any) => unknown) => { fake.setDecode(f); fake.state.sidecar.decode = f(fake.state.sidecar.decode); } }));
+import { newSidecar, type Sidecar, type DecodeSettings } from '@shared/sidecar';
+interface TestState { engineSession: string | null; frameKind: string; hello: {view_options: string[]}; sidecar: Sidecar; metadata: {model: string} }
+const fake = vi.hoisted(() => ({ state: {} as TestState, cameraProfile: vi.fn(), setDecode: vi.fn() }));
+vi.mock('../state/session', () => ({ useSession: (f: (s: TestState) => unknown) => f(fake.state),
+  sessionStore: { getState: () => fake.state }, setDecode: (f: (d: DecodeSettings) => DecodeSettings) => { fake.setDecode(f); fake.state.sidecar.decode = f(fake.state.sidecar.decode); } }));
 vi.mock('../host/client', () => ({ host: () => ({ cameraProfile: fake.cameraProfile }) }));
 vi.mock('../platform', () => ({ platform: () => ({ storeRead: async () => null, storeWrite: async () => {} }) }));
 vi.mock('../i18n', () => ({ tz: (s: string) => s }));

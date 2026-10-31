@@ -65,6 +65,7 @@ import { inTauri } from '../host/transport';
 import { onFrameDrop } from '../windows/frameDrag';
 import { clampZoom } from './zoom';
 import { recoveryTextureLimit } from './displayUpload';
+import { LocalMaskOverlay } from './LocalMaskOverlay';
 import { platform } from '../platform';
 
 const SURROUND = 0x5f / 255;
@@ -565,6 +566,7 @@ export function Canvas() {
       data-testid="canvas"
     >
       <canvas key={canvasGeneration} ref={canvas} className="canvas-gl" />
+      {layout&&!cropping&&!showingOriginal&&!comparing&&<LocalMaskOverlay layout={layout} dpr={size.dpr}/>}
       {pair && pairGates && layout && <svg className="crop-overlay" width="100%" height="100%" data-testid="pair-overlay">
         {PAIR_SIDES.map((side) => {
           const r = pairGates[side], x = css(layout.offset.x + r.x * layout.outSize.width), y = css(layout.offset.y + r.y * layout.outSize.height);

@@ -7,6 +7,7 @@ import { tz } from '../i18n';
 import { ToggleRow } from '../controls/controls';
 import { clearDisplayCache, configureDisplayCache, displayCacheStatus, type DisplayCacheStatus } from '../state/displayCache';
 import { checkWindowsUpdate, type UpdateStatus } from './updateCheck';
+import { AiAssistantSettings } from './AiAssistantSettings';
 
 const GiB = 1024 ** 3;
 export function formatBytes(value: unknown): string {
@@ -121,6 +122,9 @@ export function UpdateSettings({ version, os }: { version?: string; os?: string 
 
 export interface AgentAccess { enabled: boolean; runtime_available: boolean; executable: string; command: string; mcp_config: unknown }
 export function AgentsSettings() {
+  return <><AiAssistantSettings /><details><summary>{tz('Advanced · external agents and command line','高级 · 外部智能体与命令行')}</summary><LocalAgentSettings /></details></>;
+}
+function LocalAgentSettings() {
   const [access, setAccess] = useState<AgentAccess | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);

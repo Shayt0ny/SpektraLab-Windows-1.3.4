@@ -25,7 +25,7 @@ export function fields(catalog: StockCatalog): Field[] {
   bools('params.dateBack','active withData');
   for(const [key,values] of Object.entries({face:['lcd','dots','data'],order:['us','japan'],placement:['frame','rebate'],corner:['tl','tr','bl','br']}))add(`params.dateBack.${key}`,'string',undefined,values);
   numbers('params.dateBack',{insetXMM:[0,30],insetYMM:[0,30],size:[.4,3],brightnessEV:[-2,8]});
-  bools('adjustments','enabled');numbers('adjustments',{temperature:[-100,100],tint:[-100,100],exposure:[-3,3],contrast:[-50,50],brightness:[-50,50],saturation:[-100,100],highlights:[-100,100],shadows:[-100,100],blackPoint:[0,50],whitePoint:[0,50]});
+  bools('adjustments','enabled');numbers('adjustments',{temperature:[-100,100],tint:[-100,100],exposure:[-3,3],contrast:[-50,50],brightness:[-50,50],saturation:[-100,100],highlights:[-100,100],shadows:[-100,100],blackPoint:[-50,50],whitePoint:[-50,50]});
   numbers('adjustments.vignette',{amount:[-100,100],midpoint:[0,100]});
   for(const c of ['rgb','luma','red','green','blue'])add(`adjustments.curves.${c}.points`,'points');
   for(const z of ['master','shadows','midtones','highlights'])numbers(`adjustments.colorBalance.${z}`,{hue:[0,360],saturation:[0,1],luminance:[-1,1]});

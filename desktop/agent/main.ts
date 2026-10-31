@@ -5,7 +5,7 @@ import { Workspace, removeTemporary, type Result } from './workspace';
 import { mcp } from './tools';
 import { parse } from './cli';
 import { Refused } from './schema';
-const usage=`SpektraLab CLI: status | schema | stocks | recipes | info|get|reset|process|latitude FILE
+const usage=`Spektra Studio CLI: status | schema | stocks | recipes | info|get|reset|process|latitude FILE
 edit FILE --patch JSON|@FILE|- [--preview OUT.jpg]
 place FILE --highlight STOPS --shadow STOPS [--preview OUT.jpg]
 preview FILE -o OUT.jpg [--long-edge N]

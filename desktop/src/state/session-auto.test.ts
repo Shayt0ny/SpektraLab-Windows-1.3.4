@@ -6,8 +6,10 @@ import type * as Session from './session';
 import { newSidecar } from '@shared/sidecar';
 
 const fake=vi.hoisted(()=>({renderView:vi.fn(),setParams:vi.fn(async()=>({})),close:vi.fn(async()=>{}),
+  invoke:vi.fn(),
   frames:{print:null as RenderReply|null,original:null},logs:[] as string[]}));
 vi.mock('../host/client',()=>({HostCallError:class extends Error{},host:()=>fake}));
+vi.mock('@tauri-apps/api/core',()=>({invoke:fake.invoke}));
 vi.mock('./frames',()=>({frameImages:fake.frames,makeThumbFromPrint:async()=>null,THUMB_EDGE:320}));
 vi.mock('../platform',()=>({platform:()=>({log:(_level:string,message:string)=>fake.logs.push(message),
   sidecarSave:async()=>'',sidecarLoad:async()=>null}),baseName:(p:string)=>p,dirName:()=>'/owned'}));
@@ -29,6 +31,47 @@ beforeEach(async()=>{
 afterEach(()=>{vi.clearAllTimers();vi.useRealTimers();vi.unstubAllGlobals();});
 
 describe('automatic grade action',()=>{
+  it('sends only numeric grade context to AI and applies a reviewed proposal as one undo step',async()=>{
+    const ai=await import('./ai');const before=structuredClone(session.sessionStore.getState().sidecar);
+    fake.invoke.mockResolvedValue({summary:'Gentle lift',adjustments:{exposure:.3,highlights:-10}});
+    const proposal=await ai.suggestGrade('openai','A little brighter');
+    expect(fake.invoke).toHaveBeenCalledOnce();
+    const[method,payload]=fake.invoke.mock.calls[0]!;expect(method).toBe('ai_suggest');
+    expect(payload).toMatchObject({provider:'openai',prompt:'A little brighter'});
+    expect(Object.keys(payload.context).sort()).toEqual(['adjustments','statistics']);
+    expect(JSON.stringify(payload)).not.toContain('/owned');expect(JSON.stringify(payload)).not.toContain('frame.NEF');
+    expect(session.sessionStore.getState().undo).toHaveLength(0);
+    expect(ai.applyAiProposal(proposal)).toBe(true);expect(session.sessionStore.getState().undo).toHaveLength(1);
+    expect(session.sessionStore.getState().sidecar.adjustments.exposure).toBe(.3);
+    session.undo();expect(session.sessionStore.getState().sidecar.adjustments).toEqual(before.adjustments);
+  });
+  it('refuses an AI proposal after manual editing or changing the selected photo',async()=>{
+    const ai=await import('./ai');const proposal={summary:'Lift',adjustments:{exposure:.3},stamp:ai.aiStamp()};
+    session.setAdjustments(a=>({...a,brightness:4}));expect(ai.applyAiProposal(proposal)).toBe(false);
+    expect(session.sessionStore.getState().sidecar.adjustments.exposure).toBe(0);
+  });
+  it('automatically builds an editable luma curve without changing other grade controls',async()=>{
+    const before=structuredClone(session.sessionStore.getState().sidecar);
+    await session.autoCurve();
+    const state=session.sessionStore.getState();
+    expect(state.sidecar.adjustments.curves.luma.points.length).toBeGreaterThan(2);
+    expect({...state.sidecar.adjustments,curves:before.adjustments.curves}).toEqual(before.adjustments);
+    expect(state.sidecar.params).toEqual(before.params);
+    expect(state.undo).toHaveLength(1);
+    const curve=structuredClone(state.sidecar.adjustments.curves);
+    await session.autoCurve();
+    expect(session.sessionStore.getState().sidecar.adjustments.curves).toEqual(curve);
+    expect(session.sessionStore.getState().undo).toHaveLength(1);
+    session.undo();expect(session.sessionStore.getState().sidecar.adjustments).toEqual(before.adjustments);
+  });
+  it('discards automatic curves when the frame is changed during analysis',async()=>{
+    let release!:(value:RenderReply)=>void;
+    fake.renderView.mockImplementationOnce(()=>new Promise(resolve=>{release=resolve;}));
+    const pending=session.autoCurve();
+    session.sessionStore.setState({selection:'/owned/another.NEF'});
+    release(frame());await pending;
+    expect(session.sessionStore.getState().undo).toHaveLength(0);
+  });
   it('does not disable auto for saved UI fields that do not change effective engine parameters',()=>{
     const s=session.sessionStore.getState();
     const params={...s.sidecar.params,futureUiChoice:true};

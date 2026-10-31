@@ -444,7 +444,7 @@ Json m_hello(const Request&) {
     Json raw_decoders = Json::array();
     for (const char* decoder : {"auto", "libraw", "candidate"}) raw_decoders.push(str(decoder));
     r.set("raw_decoders", std::move(raw_decoders));
-    Json view_options = Json::array(); view_options.push(str("no_film")); view_options.push(str("camera_curve")); view_options.push(str("lcp"));
+    Json view_options = Json::array(); view_options.push(str("no_film")); view_options.push(str("camera_curve")); view_options.push(str("lcp")); view_options.push(str("local_masks"));
     r.set("view_options", std::move(view_options));
     Json frame_options = Json::array(); frame_options.push(str("no-film"));
     r.set("frame_options", std::move(frame_options));

@@ -6,6 +6,12 @@ const release = (tag = 'spektralab-v1.3.3', name = 'SpektraLab-windows-x64.zip')
   assets: [{ name, browser_download_url: `${root}/download/${tag}/${name}`, size: 1234, state: 'uploaded' }] });
 
 describe('Windows release identification', () => {
+  it('compares Studio revisions without offering the higher numbered upstream Mac/legacy product',()=>{
+    const studio=(n:number)=>release(`Spektra-Studio-1.0.0-win.${n}`,`Spektra-Studio-1.0.0-win.${n}-Windows-x64.zip`);
+    expect(selectWindowsRelease([release('spektralab-v9.0.0')],'1.0.0-win.1').kind).toBe('unavailable');
+    expect(selectWindowsRelease([studio(1)],'1.0.0-win.1').kind).toBe('current');
+    expect(selectWindowsRelease([studio(2),studio(1)],'1.0.0-win.1')).toMatchObject({kind:'available',version:'1.0.0-win.2'});
+  });
   it('does not turn a Mac release or an unsupported architecture into a Windows update', () => {
     for (const name of ['SpektraLab-1.3.3.dmg', 'SpektraLab-macos-arm64.zip', 'SpektraLab-windows-arm64.zip',
       'SpektraLab-windows.zip', 'SpektraLab-windows-x64-source.zip', 'source.zip'])

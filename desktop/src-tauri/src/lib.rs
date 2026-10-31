@@ -10,6 +10,7 @@ pub mod frame_cache;
 pub mod agent_files;
 pub mod workspace;
 pub mod diagnostics;
+pub mod ai;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -334,6 +335,11 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            ai::ai_settings_get,
+            ai::ai_settings_save,
+            ai::ai_key_remove,
+            ai::ai_connection_test,
+            ai::ai_suggest,
             host_request,
             host_request_upload,
             host_state,

@@ -34,7 +34,7 @@ export function DiagnosticSettings({ paths, hello, includePaths }: { paths: AppP
     setNotice(tz('Saved. Host verbosity and node timings apply on the next engine restart; a new log directory applies on the next app launch.', '已保存。宿主日志和逐节点计时在下次重启引擎时生效；日志目录在下次启动应用时生效。'));
   };
   const bundle = () => void action(async () => {
-    const path = await platform().pickSave(tz('Save diagnostic bundle', '保存诊断包'), 'SpektraLab-diagnostics.zip', 'zip');
+    const path = await platform().pickSave(tz('Save diagnostic bundle', '保存诊断包'), 'Spektra-Studio-diagnostics.zip', 'zip');
     if (!path) return;
     const [d, memory] = await Promise.all([host().diagnostics(), host().memoryReport().catch(() => null)]);
     const result = await invoke<string>('diagnostics_save_bundle', { path, summary: diagnosticReport(paths, hello, d, includePaths, memory), includePaths });

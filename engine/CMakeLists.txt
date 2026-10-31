@@ -140,7 +140,7 @@ if(SPEKTRALAB_PORTABLE_BACKEND)
             spk_couplers_correction spk_spectral_epilogue
             spk_print_exposure spk_cam16ucs_compress
             spk_cctf_encode_matrix spk_to_rgba16
-            spk_view_grade spk_view_grade_float spk_view_grade_di spk_view_geometry spk_view_pack spk_view_cam16 spk_view_pair
+            spk_view_grade spk_view_grade_float spk_view_grade_di spk_view_geometry spk_view_pack spk_view_cam16 spk_view_pair spk_view_local_masks
             spk_grain_layers spk_grain_layer_one spk_grain_simple
             spk_lognormal_field spk_rng_probe spk_mul spk_glare_add
             spk_reduce_max spk_boost spk_highlight_headroom spk_bw_correct spk_edr spk_cctf_decode
@@ -268,6 +268,9 @@ if(SPEKTRALAB_PORTABLE_BACKEND)
                 target_include_directories(spk_raw_camera_profile PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
                 target_link_libraries(spk_raw_camera_profile PRIVATE spk_libraw)
                 add_test(NAME spk_raw_camera_profile COMMAND spk_raw_camera_profile)
+                add_executable(spk_raw_canon_colordata tests/raw_canon_colordata.cpp)
+                target_link_libraries(spk_raw_canon_colordata PRIVATE spk_libraw)
+                add_test(NAME spk_raw_canon_colordata COMMAND spk_raw_canon_colordata)
                 add_executable(spk_raw_active_area tests/raw_active_area.cpp)
                 target_include_directories(spk_raw_active_area PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
                 target_link_libraries(spk_raw_active_area PRIVATE spk_libraw)

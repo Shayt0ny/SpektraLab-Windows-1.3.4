@@ -15,6 +15,8 @@ file(GLOB_RECURSE libraw_sources CONFIGURE_DEPENDS "${SPEKTRALAB_LIBRAW_SOURCE}/
 # not extra implementations. Including them beside the real processing units
 # makes small metadata-only consumers fail with duplicate symbols.
 list(FILTER libraw_sources EXCLUDE REGEX "/[^/]*_ph\\.cpp$")
+include("${CMAKE_CURRENT_LIST_DIR}/CanonColorData.cmake")
+spk_canon_colordata(libraw_sources "${SPEKTRALAB_LIBRAW_SOURCE}" libraw)
 add_library(spk_libraw STATIC ${libraw_sources})
 target_include_directories(spk_libraw PUBLIC "${SPEKTRALAB_LIBRAW_SOURCE}")
 target_compile_definitions(spk_libraw PUBLIC LIBRAW_NODLL)

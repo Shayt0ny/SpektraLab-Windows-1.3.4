@@ -37,11 +37,11 @@
   --disabled-opacity: 0.38;
 
   /* Type: two section-title sizes (12 left, 10.5 right), body 10.5, small 9. */
-  --fs-rail-title: calc(12px * var(--ui-scale));
+  --fs-rail-title: calc(13px * var(--ui-scale));
   --fs-left-section: calc(12px * var(--ui-scale));
-  --fs-right-section: calc(10.5px * var(--ui-scale));
-  --fs-body: calc(10.5px * var(--ui-scale));
-  --fs-small: calc(9px * var(--ui-scale));
+  --fs-right-section: calc(12px * var(--ui-scale));
+  --fs-body: calc(11.5px * var(--ui-scale));
+  --fs-small: calc(10px * var(--ui-scale));
   --fs-action: calc(13.11px * var(--ui-scale));
 
   /* Metrics */
@@ -50,17 +50,17 @@
   --filmstrip-height: calc(132px + 18px * var(--ui-scale));
   --header-height: 38px;
   --section-header: 26px;
-  --row-height: calc(22px * var(--ui-scale));
+  --row-height: calc(26px * var(--ui-scale));
   --row-inset: 16px;
-  --label-width: calc(84px * var(--ui-scale));
-  --param-label-width: calc(96px * var(--ui-scale));
-  --value-width: calc(44px * var(--ui-scale));
-  --control-height: calc(14px * var(--ui-scale));
+  --label-width: calc(78px * var(--ui-scale));
+  --param-label-width: calc(86px * var(--ui-scale));
+  --value-width: calc(48px * var(--ui-scale));
+  --control-height: calc(20px * var(--ui-scale));
 
   /* System faces per OS; nothing bundled. Noto Sans CJK SC / Microsoft YaHei
      carry the Chinese strings. */
-  --font-ui: 'Segoe UI Variable Text', 'Segoe UI', 'Inter', 'Noto Sans', 'Cantarell', 'Ubuntu', 'DejaVu Sans',
-    'Noto Sans CJK SC', 'Source Han Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', system-ui, sans-serif;
+  --font-ui: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei',
+    'Noto Sans CJK SC', 'Source Han Sans SC', 'PingFang SC', system-ui, sans-serif;
   --font-mono: 'Cascadia Mono', 'Consolas', 'DejaVu Sans Mono', 'Noto Sans Mono', ui-monospace, monospace;
 }
 
@@ -78,6 +78,7 @@ body,
   color: var(--text);
   font-family: var(--font-ui);
   font-size: var(--fs-body);
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   user-select: none;
   -webkit-user-select: none;
@@ -351,6 +352,18 @@ input {
   inset: 0;
   pointer-events: none;
 }
+.local-mask-overlay { position: absolute; inset: 0; touch-action: none; cursor: crosshair; }
+.mask-add, .mask-actions { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+.mask-add .btn { flex: 1; padding-inline: 7px; }
+.mask-list { display: grid; gap: 3px; margin: 8px 0; }
+.mask-list-row { display: flex; align-items: center; min-height: 32px; border: 1px solid transparent; border-radius: 5px; }
+.mask-list-row.selected { background: var(--rule); border-color: var(--accent); }
+.mask-eye, .mask-remove { flex: 0 0 29px; padding: 4px; color: var(--dim); }
+.mask-eye[aria-pressed=true] { color: var(--accent); }
+.mask-select { flex: 1; min-width: 0; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 5px; }
+.mask-name { width: 100%; box-sizing: border-box; margin: 5px 0; padding: 7px 9px; border: 1px solid var(--rule); border-radius: 5px; background: var(--field); color: var(--text); }
+.effects-advanced { margin: 9px 0; }
+.effects-advanced summary { color: var(--dim); cursor: pointer; padding: 5px 0; }
 .compare-line {
   position: absolute;
   width: 1px;
@@ -471,15 +484,15 @@ input {
   border-top: 1px solid var(--rule);
 }
 .section-header {
-  height: var(--section-header);
+  min-height: max(var(--section-header), calc(29px * var(--ui-scale)));
   display: flex;
   align-items: center;
   padding: 0 10px 0 7px;
   gap: 7px;
 }
 .section-header .title {
-  font-weight: 700;
-  flex: 1;
+  font-weight: 600;
+  flex: 1 0 auto;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -494,6 +507,11 @@ input {
   font-size: var(--fs-small);
   color: var(--dim);
   white-space: nowrap;
+  min-width: 0;
+  max-width: 52%;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .disclosure {
   width: 12px;
@@ -510,7 +528,7 @@ input {
   padding: 0 10px 0 var(--row-inset);
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 7px;
 }
 .section.unsupported .section-body {
   opacity: var(--disabled-opacity);
@@ -537,7 +555,7 @@ input {
 .row-label {
   min-width: var(--label-width);
   flex: none;
-  font-weight: 600;
+  font-weight: 500;
   white-space: nowrap;
 }
 .rail.right .row-label {
@@ -557,7 +575,7 @@ input {
 .caption {
   font-size: var(--fs-small);
   color: var(--dim);
-  line-height: 1.35;
+  line-height: 1.6;
 }
 
 /* the scrub slider */
@@ -615,7 +633,7 @@ input {
 .value-field {
   width: var(--value-width);
   flex: none;
-  height: calc(14px * var(--ui-scale));
+  height: var(--control-height);
   border-radius: 8.5px;
   background: var(--pill);
   color: var(--text);
@@ -629,7 +647,8 @@ input {
 
 /* pills, toggles, fields */
 .pill-menu {
-  height: calc(14px * var(--ui-scale));
+  min-height: var(--control-height);
+  line-height: 1.3;
   border-radius: 999px;
   background: var(--pill);
   padding: 0 8px;
@@ -669,7 +688,7 @@ input {
 }
 .unit-field {
   width: 50px;
-  height: calc(14px * var(--ui-scale));
+  height: var(--control-height);
   border-radius: 4.25px;
   border: none;
   background: var(--pill);
@@ -887,6 +906,7 @@ input {
   padding: 4px 18px 14px;
   overflow-y: auto;
   user-select: text;
+  min-height: 0;
 }
 .dialog .dialog-actions {
   display: flex;
@@ -896,8 +916,9 @@ input {
   border-top: 1px solid var(--rule);
 }
 .btn {
-  height: 24px;
-  padding: 0 14px;
+  min-height: calc(26px * var(--ui-scale));
+  padding: 4px 12px;
+  line-height: 1.4;
   border-radius: 6px;
   background: #4a4a49;
   color: var(--text);
@@ -925,12 +946,57 @@ input {
   color: var(--text);
 }
 .settings-group {
-  margin: 8px 0 14px;
+  margin: 0 0 20px;
+  flex-shrink: 0;
 }
 .settings-group h3 {
   font-size: var(--fs-body);
-  margin: 0 0 6px;
+  margin: 0 0 12px;
   color: var(--secondary-text);
+}
+
+/* Settings owns its scroll area. Rail flex shrinking used to squeeze long
+   settings pages until headings, controls and captions overlapped. */
+.dialog[data-testid='settings'] { width: min(880px, 94vw); height: min(740px, 88vh); max-height: 88vh; }
+.dialog[data-testid='settings'] > h2 { padding: 22px 24px 18px; border-bottom: 1px solid var(--rule); font-size: calc(18px * var(--ui-scale)); }
+.settings-layout { display: grid; grid-template-columns: 164px minmax(0, 1fr); flex: 1; min-height: 0; }
+.settings-nav { display: flex; flex-direction: column; gap: 6px; padding: 18px 12px; border-right: 1px solid var(--rule); overflow-y: auto; }
+.settings-nav button { min-height: 40px; padding: 10px 12px; text-align: left; border-radius: 7px; color: var(--secondary-text); line-height: 1.4; }
+.settings-nav button:hover { background: #363635; }
+.settings-nav button.on { background: #45413a; color: var(--accent); font-weight: 600; }
+.dialog .settings-content { padding: 24px; overflow-y: auto; overflow-x: hidden; display: block; }
+.settings-content .settings-group { padding: 0 0 22px; margin: 0 0 22px; border-bottom: 1px solid var(--rule); }
+.settings-content .settings-group:last-child { margin-bottom: 0; border-bottom: 0; }
+.settings-content h3 { font-size: calc(13px * var(--ui-scale)); font-weight: 600; }
+.settings-content .row { flex-wrap: wrap; height: auto; gap: 10px; margin: 8px 0; }
+.settings-content .row-label { min-width: 0; flex: 1; white-space: normal; font-weight: 500; }
+.settings-content .pill-menu { min-height: 32px; max-width: 65%; padding: 6px 12px; border-radius: 6px; }
+.settings-content .caption { margin: 10px 0 0; color: #aaa9a5; overflow-wrap: anywhere; }
+.settings-content .btn { height: auto; min-height: 34px; max-width: 100%; }
+.settings-content dl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 18px; }
+.settings-content dt, .settings-content dd { margin: 0; }
+.settings-content dd { font-variant-numeric: tabular-nums; color: var(--text); }
+.settings-content details { margin-top: 16px; }
+.settings-content summary { cursor: pointer; padding: 8px 0; color: var(--secondary-text); }
+.settings-content pre { max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: var(--plot); border-radius: 6px; }
+.settings-field { display: flex; flex-direction: column; gap: 7px; margin: 14px 0; font-weight: 500; min-width: 0; }
+.settings-field input, .settings-field select, .settings-field textarea, .settings-content input[type='number'] {
+  width: 100%; min-height: 36px; padding: 8px 10px; background: var(--plot); color: var(--text); border: 1px solid #545451; border-radius: 6px; font: inherit; user-select: text;
+}
+.settings-field textarea { min-height: 90px; resize: vertical; }
+.settings-field input:focus, .settings-field textarea:focus { border-color: var(--accent); }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+.settings-status { padding: 10px 12px; border-radius: 6px; background: var(--plot); line-height: 1.6; margin-top: 12px; overflow-wrap: anywhere; }
+.curve-channels { display: flex; flex-wrap: wrap; gap: 4px; }
+.curve-channels .btn { flex: 1; min-width: 28px; padding: 4px 5px; font-size: var(--fs-small); }
+.curve-auto { width: 100%; }
+.plot { display: block; width: 100%; }
+.ai-proposal { padding: 14px; border: 1px solid var(--rule); border-radius: 8px; margin-top: 16px; }
+.ai-proposal p { margin: 0 0 10px; white-space: pre-wrap; }
+@media (max-width: 720px) {
+  .settings-layout { grid-template-columns: 122px minmax(0, 1fr); }
+  .settings-nav { padding: 12px 8px; }
+  .dialog .settings-content { padding: 18px; }
 }
 .mono {
   font-family: var(--font-mono);

@@ -12,6 +12,7 @@
 //   → black/white point → saturation → colour balance → curves → vignette
 
 import { clamp } from './params.ts';
+import {decodeLocalMasks,maskCoverage,rasterizeBrush,type LocalMask} from './localMasks.ts';
 
 export interface ColorZone {
   hue: number;
@@ -37,6 +38,7 @@ export const CURVE_CHANNELS: CurveChannel[] = ['rgb', 'luma', 'red', 'green', 'b
 export type CurveSet = Record<CurveChannel, Curve>;
 
 export interface Adjustments {
+  localMasks?: LocalMask[];
   enabled: boolean;
   temperature: number;
   tint: number;
@@ -91,6 +93,7 @@ export const zoneNeutral = (z: ColorZone) => z.saturation === 0 && z.luminance =
 
 export function isNeutral(a: Adjustments): boolean {
   return (
+    !(a.localMasks?.some(m=>m.enabled&&m.amount>0&&Object.values(m.adjustments).some(v=>v!==0))) &&
     a.temperature === 0 &&
     a.tint === 0 &&
     a.exposure === 0 &&
@@ -392,10 +395,12 @@ export function applyLayer2(data: Float32Array, width: number, height: number, a
   const u = layer2Uniforms(a, midGrey);
   if (!u.enabled) return;
   const tables = u.curvesActive ? curveTables(a.curves) : null;
+  const masks=(a.localMasks??[]).filter(m=>m.enabled&&m.amount>0).map(m=>({m,u:layer2Uniforms({...ADJUSTMENTS_DEFAULT,...m.adjustments},midGrey),r:m.kind==='brush'?rasterizeBrush(m,width/height):undefined}));
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const i = (y * width + x) * 4;
-      const [r, g, b] = layer2Pixel([data[i]!, data[i + 1]!, data[i + 2]!], u, tables, (x + 0.5) / width, (y + 0.5) / height);
+      let [r, g, b] = layer2Pixel([data[i]!, data[i + 1]!, data[i + 2]!], u, tables, (x + 0.5) / width, (y + 0.5) / height);
+      for(const{m,u:mu,r:mr}of masks){const cover=maskCoverage(m,{x:(x+.5)/width,y:(y+.5)/height},mr);if(cover>0){const local=layer2Tone([r,g,b],mu);r+= (sat(local[0])-r)*cover;g+=(sat(local[1])-g)*cover;b+=(sat(local[2])-b)*cover;}}
       data[i] = r;
       data[i + 1] = g;
       data[i + 2] = b;
@@ -432,6 +437,7 @@ export function decodeAdjustments(raw: unknown): Adjustments {
   const cb = obj(o.colorBalance);
   const v = obj(o.vignette);
   return {
+    ...(o.localMasks===undefined?{}:{localMasks:decodeLocalMasks(o.localMasks)}),
     enabled: typeof o.enabled === 'boolean' ? o.enabled : true,
     temperature: num(o.temperature, d.temperature),
     tint: num(o.tint, d.tint),

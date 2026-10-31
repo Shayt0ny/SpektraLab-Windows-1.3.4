@@ -1,4 +1,4 @@
-import { type Adjustments, curveTables, layer2Pixel, layer2Uniforms } from '@shared/adjustments';
+import { ADJUSTMENTS_DEFAULT, applyLayer2, type Adjustments, curveTables, layer2Pixel, layer2Uniforms } from '@shared/adjustments';
 import { type Geometry, sourcePoint } from '@shared/geometry';
 
 /** The file's pixels: the print (rgba16) → geometry → Layer 2, at `out` size. */
@@ -10,6 +10,14 @@ export function filePixels(
   out: { width: number; height: number },
   midGrey: number,
 ): Uint16Array {
+  // Masks belong to the complete print, before crop/rotation/resampling.
+  // Keep the legacy no-mask path byte-for-byte unchanged.
+  if (a.enabled && a.localMasks?.length) {
+    const graded = Float32Array.from(src, v => v / 65535);
+    applyLayer2(graded, srcSize.width, srcSize.height, a, midGrey);
+    src = Uint16Array.from(graded, v => Math.round(v * 65535));
+    a = { ...ADJUSTMENTS_DEFAULT, enabled: false };
+  }
   const u = layer2Uniforms(a, midGrey);
   const tables = u.curvesActive ? curveTables(a.curves) : null;
   const { width: W, height: H } = srcSize;

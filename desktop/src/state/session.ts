@@ -38,6 +38,7 @@ import { type HalfFramePair, type PairHole, type PairLayer, type PairPlacement, 
 import { type DecodeSettings, type Sidecar, decodeSidecar, encodeSidecar, newSidecar } from '@shared/sidecar';
 import { decodeWire, isRawPath, modeOf } from '@shared/whiteBalance';
 import { addsClipping, autoToneBaseline, autoToneProposal, insetAutoRegion, saferAutoTone, toneStatistics, type AutoRegion } from '@shared/autoAdjust';
+import { automaticLumaCurve } from '@shared/autoCurve';
 import { type ClipboardGroup, type SettingsClip, CLIPBOARD_GROUPS, applyClip, clipChanges } from '@shared/clipboard';
 import { EMPTY_CATALOG, type StockCatalog, loadCatalog } from '@shared/stocks';
 import { type LatitudeReply, type PlacementIssue, type PlacementSide, type PlacementWindow,
@@ -118,6 +119,7 @@ export interface SessionState {
   developing: boolean;
   autoAdjusting: boolean;
   autoAdjustMessage: string;
+  autoCurveMessage: string;
   status: string;
   lastError: string | null;
   /** Disk edits never silently replace unsaved edits in the current editor. */
@@ -175,6 +177,7 @@ const INITIAL: SessionState = {
   developing: false,
   autoAdjusting: false,
   autoAdjustMessage: '',
+  autoCurveMessage: '',
   status: '',
   lastError: null,
   externalEditConflict: false,
@@ -909,7 +912,7 @@ export function setAdjustments(fn: (a: Adjustments) => Adjustments) {
   const next = fn(s.sidecar.adjustments);
   if (jsonEqual(next, s.sidecar.adjustments)) return;
   pushUndo();
-  set({ sidecar: { ...s.sidecar, adjustments: next }, autoAdjustMessage: '' });
+  set({ sidecar: { ...s.sidecar, adjustments: next }, autoAdjustMessage: '', autoCurveMessage: '' });
   scheduleSave();
   if (hostViews() && !s.batchExporting) void requestPrint();
 }
@@ -930,6 +933,44 @@ export function canAutoAdjust(): boolean {
 function autoAdjustmentStamp(s: SessionState): string {
   return JSON.stringify([s.engineSession,s.selection,s.sidecar.params,s.sidecar.adjustments,s.sidecar.geometry,
     s.sidecar.decode,s.sidecar.noFilm,s.pair,s.pairLayer,s.tool]);
+}
+
+export async function autoCurve(): Promise<boolean> {
+  if (!canAutoAdjust()) return false;
+  const snapshot=get(),sid=snapshot.engineSession!,stamp=autoAdjustmentStamp(snapshot),token=++autoAdjustToken;
+  const current=()=>autoAdjustToken===token && !get().batchExporting && !get().redecoding && !decodeTimer && autoAdjustmentStamp(get())===stamp;
+  foregroundWork();if(fullTimer)clearTimeout(fullTimer);
+  set({autoAdjusting:true,autoCurveMessage:''});
+  try {
+    const baseline={...snapshot.sidecar.adjustments,enabled:true,curves:{...snapshot.sidecar.adjustments.curves,luma:{points:[[0,0],[1,1]] as [number,number][]}}};
+    const options={geometry:canvasGeometryFor(snapshot.sidecar.params,snapshot.sidecar.geometry,snapshot.gate,snapshot.sidecar.noFilm),
+      source_geometry:sourceGeometryFor(snapshot.sidecar.params,snapshot.sidecar.geometry,snapshot.gate,snapshot.sidecar.noFilm)??GEOMETRY_DEFAULT,
+      ...(snapshot.sidecar.noFilm?{no_film:true}:{}),display:'srgb' as const,generation:1_100_000_000+token,long_edge:512};
+    const measure=(adjustments:Adjustments)=>host().renderView(sid,'live',{...options,adjustments});
+    const image=await measure(baseline);if(!current())return false;
+    let regions:AutoRegion[]|undefined;
+    if(edgeEffective(snapshot.sidecar.params.filmEdge,snapshot.gate,snapshot.sidecar.noFilm)){
+      const layout=await host().overscanGeometry(sid);if(!current())return false;
+      if(!layout.valid||!layout.gates?.length)throw Error(tz('Picture boundaries are not ready.','画面范围尚未准备完成。'));
+      regions=layout.gates.map(gate=>{
+        if(gate.length!==8)throw Error('Invalid film gate geometry');
+        return insetAutoRegion(Array.from({length:4},(_,i)=>[gate[i*2]!,gate[i*2+1]!] as const));
+      });
+    }
+    const before=toneStatistics(image,regions);let curve=automaticLumaCurve(before);
+    if(!curve){set({autoCurveMessage:tz('Not enough tonal variation. Current curve kept.','画面层次不足，已保留当前曲线。')});return false;}
+    for(let attempt=0;attempt<3;attempt++){
+      const result=await measure({...baseline,curves:{...baseline.curves,luma:curve}});if(!current())return false;
+      if(!addsClipping(before,toneStatistics(result,regions))){
+        lastUndoAt=-Infinity;const committed=curve;
+        setAdjustments(a=>({...a,enabled:true,curves:{...a.curves,luma:committed}}));
+        set({autoCurveMessage:tz('Luma curve applied · Ctrl+Z to undo.','已自动调整明度曲线 · Ctrl+Z 撤销。')});return true;
+      }
+      curve={points:curve.points.map(([x,y])=>[x,x+(y-x)*.5])};
+    }
+    set({autoCurveMessage:tz('Current curve kept to protect highlight and shadow detail.','为保留高光和暗部细节，已保留当前曲线。')});return false;
+  }catch(e){if(current())noteError(tz('Automatic curve','自动曲线'),e);return false;}
+  finally{if(autoAdjustToken===token)set({autoAdjusting:false});resumePreviewsWhenIdle();}
 }
 
 export async function autoAdjust(): Promise<void> {
@@ -1115,7 +1156,7 @@ function restore(e: UndoEntry) {
   const s = get();
   const decodeMoved = !jsonEqual(e.decode, s.sidecar.decode);
   const noFilm = e.noFilm ?? false;
-  set({ pair: e.pair ?? null, sidecar: filmStageSidecar({ ...s.sidecar, noFilm, params: e.params, adjustments: e.adjustments, geometry: e.geometry, heldCrop: e.heldCrop ?? null, decode: e.decode, placementNeedsFit: e.placementNeedsFit ?? false }) });
+  set({ pair: e.pair ?? null, autoAdjustMessage:'', autoCurveMessage:'', sidecar: filmStageSidecar({ ...s.sidecar, noFilm, params: e.params, adjustments: e.adjustments, geometry: e.geometry, heldCrop: e.heldCrop ?? null, decode: e.decode, placementNeedsFit: e.placementNeedsFit ?? false }) });
   if (noFilm !== s.sidecar.noFilm) discardModePreview();
   for (const side of PAIR_SIDES) {
     const hole = e.pair?.[side];
@@ -1619,7 +1660,7 @@ export async function openPaths(paths: string[]) {
   try {
     let entries = await platform().expandPaths(paths);
     if (!entries.length) {
-      set({ status: tz('Nothing there SpektraLab can open.', '没有 SpektraLab 能打开的文件。') });
+      set({ status: tz('Nothing there Spektra Studio can open.', '没有 Spektra Studio 能打开的文件。') });
       return;
     }
     // expandPaths expands only explicitly supplied directories. Opening a
@@ -1670,7 +1711,7 @@ async function setLibrary(folder: string, files: FileEntry[]) {
   frameImages.original = null;
   set({ folder, frames: files, selection: null, picked: [], savedGeometry: {}, thumbVersion: get().thumbVersion + 1, imageVersion: get().imageVersion + 1, badge: null });
   queueImportPreviews();
-  void platform().setTitle(`SpektraLab — ${baseName(folder)}`);
+  void platform().setTitle(`Spektra Studio — ${baseName(folder)}`);
   // The thumbnails' crop masks come from each frame's saved geometry.
   void Promise.all(
     files.map(async (f) => {
@@ -1703,7 +1744,7 @@ export function saveFrameOrder() {
 
 async function closeEngineSession() {
   autoAdjustToken++;
-  set({autoAdjusting:false,autoAdjustMessage:''});
+  set({autoAdjusting:false,autoAdjustMessage:'',autoCurveMessage:''});
   const sid = get().engineSession;
   set({ engineSession: null });
   sentParams = null;

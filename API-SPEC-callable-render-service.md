@@ -1200,3 +1200,16 @@ from the decode).
 ### Personal Windows fork integration (2026-10-29)
 
 The integrated host also advertises `hello.view_options: ["no_film"]` and accepts bypass on `render_view`. Unlike the upstream RGBA16 intermediate described above, this fork retains encoded floating-point ProPhoto until post-processing and output, so reducing exposure can recover highlights above 1. This is an intentional precision extension, not a claim of identical upstream bypass pixels. Both `frame_options` and `view_options` are advertised for their respective methods. DI plus `no_film: true` is rejected. The paired tests are `host_no_film.py` (native view/RAW/cache) and `host_no_film_upstream.py` (R4 export/proof).
+
+### Studio Windows local adjustments (2026-10-31)
+
+Studio 1.0.0-win.1 adds optional `adjustments.localMasks` at the host's
+Post-Dev boundary, advertised by `hello.view_options` `local_masks`.
+This is not a film/material wire parameter. The full JSON shape, numerical
+bounds and coverage definition are in `desktop/HOST-PROTOCOL.md`,
+“Studio local masks”. At most eight brush/linear/radial regions blend local
+encoded-ProPhoto tone/color adjustments after global Layer 2 and before
+geometry/output conversion. The same object accompanies editor views,
+proofs and frozen file exports. Missing/empty masks preserve prior rendering;
+global Post-Dev disable also bypasses masks. Existing macOS top-level `masks`
+data is retained separately. Native checks: `host_local_masks.py`.

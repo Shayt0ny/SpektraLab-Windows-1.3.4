@@ -34,7 +34,7 @@ describe('standalone CLI build', () => {
         'the bundled catalog must match the tracked source byte for byte').toBe(true);
       expect(execFileSync(process.execPath, [join(output, 'agents/agent.mjs'), '--help'], {
         encoding: 'utf8', windowsHide: true,
-      })).toContain('SpektraLab CLI:');
+      })).toContain('Spektra Studio CLI:');
       if (assets === 'missing') expect(existsSync(join(fixture, 'public/assets'))).toBe(false);
     } finally {
       // root is the unique fixture directory created above, never a source path.

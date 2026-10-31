@@ -89,6 +89,9 @@ export function TopBar() {
           <RawDevelopmentControl key={engine ?? 'no-engine'} />
         </div>
         <div className="topbar-group topbar-display-group">
+          <button className="zoom-pill" data-testid="ai-assistant-button" aria-label={tz('AI assistant','AI 助手')}
+            title={tz('AI grading assistant · connect OpenAI or DeepSeek','AI 调色助手 · 连接 OpenAI 或 DeepSeek')}
+            onClick={()=>{settingsStore.getState().set('settingsPage','agents');setPages({settingsOpen:true});}}>AI</button>
           <DropdownMenu.Root>
             <DropdownMenu.Trigger asChild>
               <button className="zoom-pill" title={previewHelp}

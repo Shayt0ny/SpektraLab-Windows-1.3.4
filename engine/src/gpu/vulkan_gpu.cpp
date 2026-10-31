@@ -93,6 +93,7 @@ constexpr KernelSpec kKernels[] = {
     {"spk_view_grade", 5, kWorkgroup},
     {"spk_view_grade_float", 5, kWorkgroup},
     {"spk_view_grade_di", 6, kWorkgroup},
+    {"spk_view_local_masks", 4, kWorkgroup},
     {"spk_view_geometry", 4, kWorkgroup},
     {"spk_view_pack", 4, kWorkgroup},
     {"spk_view_cam16", 8, kWorkgroup},

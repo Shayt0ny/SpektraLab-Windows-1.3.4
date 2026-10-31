@@ -153,7 +153,7 @@ function mirrorRenderingPreferences() {
     console.error('Could not save shared rendering preferences:', error);
     const { message } = await import('@tauri-apps/plugin-dialog');
     await message(`Could not save rendering preferences for command-line tools. Retry changing the setting before using agent export.\n${String(error)}`,
-      { title: 'SpektraLab', kind: 'error' }).catch((dialogError: unknown) => console.error(dialogError));
+      { title: 'Spektra Studio', kind: 'error' }).catch((dialogError: unknown) => console.error(dialogError));
   });
 }
 mirrorRenderingPreferences();

@@ -13,8 +13,8 @@ test('settings distinguish browser-only capability gaps and never check updates 
   await dialog.getByRole('button', { name: 'Memory', exact: true }).click();
   await expect(dialog.getByTestId('memory-ledger')).toBeVisible();
   await expect(dialog.getByText('Available in the desktop application.')).toBeVisible();
-  await dialog.getByRole('button', { name: 'Agents', exact: true }).click();
-  await expect(dialog.getByText('Available in the desktop application.')).toBeVisible();
+  await dialog.getByRole('button', { name: 'AI assistant', exact: true }).click();
+  await expect(dialog.getByText('AI connections are available in the Windows desktop app.')).toBeVisible();
   await dialog.getByRole('button', { name: 'Diagnostics', exact: true }).click();
   await expect(dialog.getByRole('button', { name: 'Copy diagnostics' })).toBeVisible();
   await expect(dialog.getByText('Off by default.', { exact: false })).toBeVisible();

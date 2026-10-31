@@ -62,14 +62,15 @@ export function SettingsDialog() {
   const set = settingsStore.getState().set;
   return (
     <Frame open={open} onClose={() => setPages({ settingsOpen: false })} title={tz('Settings', '设置')} testId="settings">
-      <div className="tabs">
+      <div className="settings-layout">
+      <nav className="settings-nav" aria-label={tz('Settings categories', '设置分类')}>
         {(['general', 'rendering', 'memory', 'diagnostics', 'agents'] as const).map((p) => (
-          <button key={p} className={page === p ? 'on' : ''} onClick={() => set('settingsPage', p)}>
-            {p === 'general' ? t('setTabGeneral') : p === 'rendering' ? t('setTabRendering') : p === 'memory' ? tz('Memory', '内存') : p === 'agents' ? tz('Agents', '智能体') : t('setTabDiagnostics')}
+          <button key={p} className={page === p ? 'on' : ''} aria-current={page === p ? 'page' : undefined} onClick={() => set('settingsPage', p)}>
+            {p === 'general' ? t('setTabGeneral') : p === 'rendering' ? t('setTabRendering') : p === 'memory' ? tz('Memory', '内存') : p === 'agents' ? tz('AI assistant', 'AI 助手') : t('setTabDiagnostics')}
           </button>
         ))}
-      </div>
-      <div className="dialog-body rail right" style={{ background: 'transparent' }}>
+      </nav>
+      <div className="dialog-body settings-content">
         {page === 'general' && (
           <>
             <div className="settings-group">
@@ -148,8 +149,7 @@ export function SettingsDialog() {
                 }}
               />
               <div className="caption">{tz('Whether cropping changes the physical scale of grain, halation and glare. Off — the default, and the physically true answer — the crop shows less of the same negative.', '裁剪是否改变颗粒、光晕与耀光的物理尺度。关闭（默认，也是物理上正确的做法）时，裁剪只是看到同一张负片的更小部分。')}</div>
-              <ToggleRow label={tz('Decouple effects', '分离效果强度')} on={st.decoupleEffects} onChange={(v) => set('decoupleEffects', v)} />
-              <div className="caption">{tz('Show a strength for each film effect beside its switch. The strengths belong to the frame: turning this off hides the sliders and changes no picture.', '在每个胶片效果的开关旁显示强度滑块。强度属于照片本身：关闭此项只会隐藏滑块，不会改变任何画面。')}</div>
+              <div className="caption">{tz('Grain, halation and glare strength are always visible under Pre-Dev → Film effects.','颗粒、光晕和耀光强度固定显示在“显影前 → 胶片效果”，无需开启额外设置。')}</div>
             </div>
             <div className="settings-group">
               <h3>{tz('Digital Intermediate', '数字中间片')}</h3>
@@ -229,6 +229,7 @@ export function SettingsDialog() {
         {open && page === 'memory' && <MemorySettings />}
         {open && page === 'agents' && <AgentsSettings />}
       </div>
+      </div>
     </Frame>
   );
 }
@@ -256,7 +257,7 @@ export function AboutDialog() {
     ).then(setTexts);
   }, [open]);
   return (
-    <Frame open={open} onClose={() => setPages({ aboutOpen: false })} title="SpektraLab" testId="about">
+    <Frame open={open} onClose={() => setPages({ aboutOpen: false })} title="Spektra Studio" testId="about">
       <div className="dialog-body">
         <p>
           {tz('Version', '版本')} {paths?.version ?? '1.3.4'} — {tz('film and print emulation built on the spektrafilm engine.', '基于 spektrafilm 引擎的胶片与相纸模拟。')}
@@ -270,8 +271,8 @@ export function AboutDialog() {
         </div>
         <p className="caption">
           {tz(
-            'SpektraLab is free software under the GNU GPL, version 3 or later. The film and paper profiles are licensed CC BY-SA 4.0; their attribution follows.',
-            'SpektraLab 是依据 GNU GPL 第 3 版或更新版本发布的自由软件。胶片与相纸的特性数据依据 CC BY-SA 4.0 授权，署名如下。',
+            'Spektra Studio is free software under the GNU GPL, version 3 or later. Based on SpektraLab; original authors and profile attribution follow.',
+            'Spektra Studio 基于 SpektraLab，依据 GNU GPL 第 3 版或更新版本发布。原作者及胶片、相纸数据署名如下。',
           )}
         </p>
         {texts.map((x) => (
@@ -323,8 +324,8 @@ export function HostFailure() {
             {vulkan && (
               <p className="caption">
                 {tz(
-                  'SpektraLab renders on the GPU through Vulkan. Make sure a Vulkan driver is installed for your graphics card (on Linux: mesa-vulkan-drivers or your vendor’s driver; on Windows: the latest driver from your GPU vendor), then restart the engine.',
-                  'SpektraLab 通过 Vulkan 在 GPU 上渲染。请确认已为显卡安装 Vulkan 驱动（Linux：mesa-vulkan-drivers 或厂商驱动；Windows：显卡厂商的最新驱动），然后重启引擎。',
+                  'Spektra Studio renders through Vulkan. Update your graphics driver, then restart the engine.',
+                  'Spektra Studio 通过 Vulkan 渲染。请更新显卡驱动，然后重启引擎。',
                 )}
               </p>
             )}

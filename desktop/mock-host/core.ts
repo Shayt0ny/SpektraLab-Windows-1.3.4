@@ -331,7 +331,7 @@ export class MockHost {
             tiff_options: ['lzw', 'preview-page'],
             thumbnail_options: ['embedded-only'],
             source_formats: ['rgba8', 'rgba16'],
-            view_options: this.opts.supportsNoFilm ? ['no_film'] : [],
+            view_options: this.opts.supportsNoFilm ? ['no_film','local_masks'] : ['local_masks'],
             frame_options: this.opts.supportsNoFilm ? ['no-film'] : [],
           },
         };

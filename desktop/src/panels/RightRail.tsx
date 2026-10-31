@@ -3,7 +3,7 @@
 //   Post-Dev: White Balance · Exposure · Curve · Color Balance (Layer 2)
 
 import { useRef, useState } from 'react';
-import { autoAdjust, canAutoAdjust } from '../state/session';
+import { autoAdjust, autoCurve, canAutoAdjust } from '../state/session';
 import { Checkbox, NumberField, PillMenu, ScrubSlider, Section, SegmentedSwitch, ToggleRow, signed } from '../controls/controls';
 import { isChinese, t, tz } from '../i18n';
 import { cameraParams, pairFocus, setCamera, shownAdjustments, shownDecode as selectedDecode, updatePair, canPickNeutral, currentPlacementWindow, hostRedecodes, placeScene, placementReady, resetScenePlacement, setAdjustments, setDecode, setFilmFrame, setFilmSide, setParams, setSideLengthMM, startNeutralPick, useSession } from '../state/session';
@@ -37,6 +37,7 @@ import {
 } from '@shared/whiteBalance';
 import { LensProfileImport } from './LensProfileImport';
 import { CurveEditor } from './CurveEditor';
+import { LocalMasksSection } from './LocalMasksSection';
 import { unsupportedReason } from './gate';
 import { type LatitudeReply, type PlacementSide, placementMessage } from '@shared/latitude';
 import { edgeEffective, edgeFormat } from '@shared/filmEdge';
@@ -62,10 +63,12 @@ export function RightRail() {
             <LatitudeSection />
             <CameraSection />
             <FilmFormatSection />
+            <FilmEffectsSection />
             <ScenePlacementSection />
           </>
         ) : (
           <>
+            <LocalMasksSection />
             <WhiteBalanceSection />
             <ExposureSection />
             <CurveSection />
@@ -262,11 +265,7 @@ function useWhiteBalance() {
 function FilmFormatSection() {
   const p = useSession((s) => s.sidecar.params);
   const gate = useSession((s) => s.gate);
-  const monochrome = useSession((s) => s.catalog.isMonochrome(s.sidecar.params.filmStock));
-  // CineStill 800T: no layer to put back, and the engine reads its own tag whatever the switch says.
-  const noLayer = useSession((s) => s.catalog.hasNoAntihalationLayer(s.sidecar.params.filmStock));
   const unit = useSettings((s) => s.sideUnit);
-  const decouple = useSettings((s) => s.decoupleEffects);
   const isCustom = p.filmFrame === FILM_FRAME_CUSTOM.id;
   const heldFrame = edgeEffective(p.filmEdge, gate) ? edgeFormat(p.filmEdge.format) : undefined;
   const heldReason = heldFrame ? tz(
@@ -274,32 +273,20 @@ function FilmFormatSection() {
     `由片边设定：${heldFrame.label}（${heldFrame.long} × ${heldFrame.short} mm）。关闭片边后可在此选择画幅。`,
   ) : undefined;
   const lengthDisabled = !!heldFrame || !isCustom;
-  const e = p.effects;
-  const setE = (patch: Partial<typeof e>) => setParams((q) => ({ ...q, effects: { ...q.effects, ...patch } }));
-  const strength = (label: string, key: 'grain' | 'halation' | 'scatter' | 'couplers' | 'glare', enabled: boolean) => (
-    <ScrubSlider label={label} value={e[key]} range={[...EFFECT_RANGES[key]] as [number, number]} zero={1} snap={0.25} format={(v) => v.toFixed(2)} disabled={!enabled} reason={t('reasonEffectOff')} onChange={(v) => setE({ [key]: v })} />
-  );
   return (
     <Section
       id="filmFormat"
       title={t('filmFormat')}
       onReset={() => {
         // The gate overrides the physical frame without replacing its saved
-        // controls. An effects reset must leave that held choice intact too.
+        // controls. Resetting format leaves the independent effects alone.
         if (!heldFrame) {
           setFilmFrame('135');
           setFilmSide('short');
         }
-        setParams((q) => ({ ...q, densityCurveGamma: 1, grainActive: true, halationActive: true, glareActive: true, effects: EFFECTS_DEFAULT }));
+        setParams((q) => ({ ...q, densityCurveGamma: 1 }));
       }}
       resetHelp={t('helpResetFilmFormat')}
-      menu={[
-        { label: t('helpAllEffectsOn'), onSelect: () => setParams((q) => ({ ...q, grainActive: true, halationActive: true, glareActive: true })) },
-        { label: t('helpAllEffectsOff'), onSelect: () => setParams((q) => ({ ...q, grainActive: false, halationActive: false, glareActive: false })) },
-        { label: t('helpResetEffectStrengths'), onSelect: () => setParams((q) => ({ ...q, effects: EFFECTS_DEFAULT })) },
-        { label: monochrome ? tz('Single-layer grain (black-and-white film)', '单层颗粒（黑白胶片）') : t('helpSubLayerGrain'),
-          checked: monochrome || e.grainLayered, disabled: !p.grainActive || monochrome, onSelect: () => setE({ grainLayered: !e.grainLayered }) },
-      ]}
     >
       <PillMenu
         label={t('filmFormatSize')}
@@ -345,10 +332,27 @@ function FilmFormatSection() {
           testId="film-format-unit"
         />
       </div>
-      <ToggleRow label={t('filmGrain')} on={p.grainActive} onChange={(v) => setParams((q) => ({ ...q, grainActive: v }))} testId="grain-toggle" />
       <ScrubSlider label={tz('Film response gamma', '胶片响应 Gamma')} value={p.densityCurveGamma} range={[.2, 4]} zero={1} snap={.1} format={(v) => v.toFixed(2)} onChange={(v) => setParams((q) => ({ ...q, densityCurveGamma: v }))} testId="density-gamma" />
-      {decouple && strength(t('filmGrainStrength'), 'grain', p.grainActive)}
+    </Section>
+  );
+}
+
+function FilmEffectsSection(){
+  const p=useSession(s=>s.sidecar.params),e=p.effects;
+  const monochrome=useSession(s=>s.catalog.isMonochrome(s.sidecar.params.filmStock));
+  const noLayer=useSession(s=>s.catalog.hasNoAntihalationLayer(s.sidecar.params.filmStock));
+  const setE=(patch:Partial<typeof e>)=>setParams(q=>({...q,effects:{...q.effects,...patch}}));
+  const strength=(label:string,key:'grain'|'halation'|'scatter'|'couplers'|'glare',enabled:boolean)=><ScrubSlider label={label} value={e[key]} range={[...EFFECT_RANGES[key]] as [number,number]} zero={1} snap={.25} format={v=>`${Math.round(v*100)} %`} parse={v=>Number.parseFloat(v)/100} disabled={!enabled} reason={t('reasonEffectOff')} onChange={v=>setE({[key]:v})} testId={`effect-strength-${key}`}/>;
+  return <Section id="filmEffects" title={tz('Film effects','胶片效果')} onReset={()=>setParams(q=>({...q,grainActive:true,halationActive:true,glareActive:true,effects:EFFECTS_DEFAULT}))}
+    resetHelp={t('helpResetEffectStrengths')} menu={[
+      {label:t('helpAllEffectsOn'),onSelect:()=>setParams(q=>({...q,grainActive:true,halationActive:true,glareActive:true}))},
+      {label:t('helpAllEffectsOff'),onSelect:()=>setParams(q=>({...q,grainActive:false,halationActive:false,glareActive:false}))},
+      {label:monochrome?tz('Single-layer grain (black-and-white film)','单层颗粒（黑白胶片）'):t('helpSubLayerGrain'),checked:monochrome||e.grainLayered,disabled:!p.grainActive||monochrome,onSelect:()=>setE({grainLayered:!e.grainLayered})},
+    ]}>
+      <ToggleRow label={t('filmGrain')} on={p.grainActive} onChange={v=>setParams(q=>({...q,grainActive:v}))} testId="grain-toggle"/>
+      {strength(t('filmGrainStrength'),'grain',p.grainActive)}
       <ToggleRow label={t('filmHalation')} on={p.halationActive} onChange={(v) => setParams((q) => ({ ...q, halationActive: v }))} />
+      {strength(t('filmHalationStrength'),'halation',p.halationActive)}
       {noLayer ? (
         <ToggleRow label={t('filmAntihalationLayer')} on={false} disabled reason={t('reasonNoAntihalationLayer')} onChange={() => {}} testId="antihalation-toggle" />
       ) : (
@@ -359,19 +363,16 @@ function FilmFormatSection() {
       {noLayer && (
         <ScrubSlider label={t('filmHighlightHeadroom')} value={e.highlightHeadroom} range={[...EFFECT_RANGES.highlightHeadroom] as [number, number]} zero={4} snap={0.5} format={(v) => v.toFixed(1)} disabled={!p.halationActive} reason={t('reasonEffectOff')} onChange={(v) => setE({ highlightHeadroom: v })} testId="headroom-slider" />
       )}
-      {decouple && (
-        <>
-          {strength(t('filmHalationStrength'), 'halation', p.halationActive)}
+      <details className="effects-advanced"><summary>{tz('Advanced effects','高级效果')}</summary>
           {strength(t('filmScatterStrength'), 'scatter', p.halationActive)}
           <ScrubSlider label={t('filmHighlightBoost')} value={e.highlightBoost} range={[0, 8]} snap={0.5} format={(v) => v.toFixed(1)} disabled={!p.halationActive} onChange={(v) => setE({ highlightBoost: v })} />
           <ToggleRow label={t('filmCouplers')} on={e.couplersActive} onChange={(v) => setE({ couplersActive: v })} />
           {strength(t('filmCouplersStrength'), 'couplers', e.couplersActive)}
-        </>
-      )}
+      </details>
       <ToggleRow label={t('filmGlare')} on={p.glareActive} disabled={!p.printEffects} reason={t('reasonPrintEffectsOff')} onChange={(v) => setParams((q) => ({ ...q, glareActive: v }))} />
-      {decouple && strength(t('filmGlareStrength'), 'glare', p.glareActive && p.printEffects)}
+      {strength(t('filmGlareStrength'), 'glare', p.glareActive && p.printEffects)}
     </Section>
-  );
+  ;
 }
 
 // ----------------------------------------------------------- Scene Placement
@@ -441,8 +442,8 @@ function ExposureSection() {
       {row(t('exposureSaturation'), 'saturation', [-100, 100], 0, 5)}
       {row(t('exposureHighlights'), 'highlights', [-100, 100], 0, 5)}
       {row(t('exposureShadows'), 'shadows', [-100, 100], 0, 5)}
-      {row(t('exposureBlackPoint'), 'blackPoint', [0, 50], 0, 1)}
-      {row(t('exposureWhitePoint'), 'whitePoint', [0, 50], 0, 1)}
+      {row(t('exposureBlackPoint'), 'blackPoint', [-50, 50], 0, 1)}
+      {row(t('exposureWhitePoint'), 'whitePoint', [-50, 50], 0, 1)}
     </Section>
   );
 }
@@ -457,6 +458,9 @@ const CHANNEL_LABEL: Record<CurveChannel, () => string> = {
 
 function CurveSection() {
   const [ch, setCh] = useState<CurveChannel>('rgb');
+  const ready=useSession(()=>canAutoAdjust());
+  const busy=useSession(s=>s.autoAdjusting);
+  const message=useSession(s=>s.autoCurveMessage);
   return (
     <Section
       id="curve"
@@ -465,9 +469,14 @@ function CurveSection() {
       resetHelp={t('helpReset')}
       menu={[{ label: t('helpResetChannels'), onSelect: () => setAdjustments((q) => ({ ...q, curves: { rgb: { points: [[0, 0], [1, 1]] }, luma: { points: [[0, 0], [1, 1]] }, red: { points: [[0, 0], [1, 1]] }, green: { points: [[0, 0], [1, 1]] }, blue: { points: [[0, 0], [1, 1]] } } })) }]}
     >
-      <div className="row" style={{ gap: 4 }}>
+      <button className="btn curve-auto" data-testid="auto-curve" disabled={!ready} onClick={()=>void autoCurve().then(applied=>{if(applied)setCh('luma');})}
+        title={tz('Build an editable luminance curve. Other controls and colour curves are preserved.','生成可编辑的明度曲线，保留其他调色和色彩通道曲线。')}>
+        {busy?tz('Analyzing…','正在分析…'):tz('Auto luma curve','自动明度曲线')}
+      </button>
+      {message&&<div className="caption" role="status" data-testid="auto-curve-message">{message}</div>}
+      <div className="curve-channels">
         {CURVE_CHANNELS.map((c) => (
-          <button key={c} className={'btn' + (c === ch ? ' primary' : '')} style={{ height: 18, padding: '0 8px', fontSize: 'var(--fs-small)' }} onClick={() => setCh(c)}>
+          <button key={c} className={'btn' + (c === ch ? ' primary' : '')} onClick={() => setCh(c)}>
             {CHANNEL_LABEL[c]()}
           </button>
         ))}

@@ -268,7 +268,7 @@ export function ExportPage() {
                 { label: tz('Restore the built-in recipes', '恢复内置配方'), onSelect: () => { save(DEFAULT_RECIPES); setCurrent(0); } },
                 {
                   label: tz('Export the print as a .cube LUT…', '将相纸导出为 .cube LUT…'),
-                  onSelect: () => void exportCube(params.printStock, `${params.printStock}.cube`).catch((e) => platform().message('SpektraLab', String(e), 'error')),
+                  onSelect: () => void exportCube(params.printStock, `${params.printStock}.cube`).catch((e) => platform().message('Spektra Studio', String(e), 'error')),
                 },
               ]}
             >
@@ -390,7 +390,8 @@ export function ExportPage() {
                 options={EXPORT_SPACES}
                 onChange={(v) => edit({ colorSpace: v })}
               />
-              <ScrubSlider label={tz('Quality', '质量')} value={r.quality} range={[10, 100]} zero={92} snap={5} format={(v) => v.toFixed(0)} disabled={r.format !== 'jpeg'} onChange={(v) => edit({ quality: Math.round(v) })} />
+              <ScrubSlider label={tz('JPEG quality', 'JPEG 质量')} value={r.quality} range={[10, 100]} zero={92} snap={5} format={(v) => `${v.toFixed(0)} %`} disabled={r.format !== 'jpeg'} onChange={(v) => edit({ quality: Math.round(v) })} testId="jpeg-quality" />
+              {r.format==='jpeg'&&<p className="caption">{tz('100% retains more fine detail and grain, with larger files. For full resolution, also keep Original size enabled below. JPEG remains lossy.', '100% 可保留更多细节和颗粒，文件也更大。要保留完整分辨率，请同时勾选下方「原始尺寸」。JPEG 仍为有损格式。')}</p>}
               {(r.format === 'tiff' || r.format === 'di') && <>
                 <PillMenu label={tz('Compression', '压缩')} value={r.tiffCompression ?? 'none'}
                   options={[{ value: 'none', label: tz('None', '无压缩') }, { value: 'lzw', label: tz('LZW (lossless)', 'LZW（无损）'), disabled: !hello?.tiff_options?.includes('lzw') }]}

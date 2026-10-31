@@ -631,3 +631,45 @@ content is limited to requested small JPEG previews, whose temporary files are
 removed after reading. Source photographs and occupied explicit preview paths
 are protected. Access is off initially, rechecked on every tool, and revoking
 it affects the next call without restarting MCP.
+
+### Studio local masks (Windows 1.0.0-win.1; additive protocol 1)
+
+`hello.view_options` advertises `local_masks`. `render_view`, `render_proof`
+and `export_frame` accept optional `adjustments.localMasks`, persisted in the
+same adjustments object and copied into frozen batch/private export snapshots.
+Missing/empty means the previous pixels and render path. The global
+`adjustments.enabled:false` bypasses local adjustments as well.
+
+Each of at most eight masks has `id` (unique nonempty string, <=80 chars),
+`name` (<=100 chars), `kind` (`linear`, `radial`, `brush`), `enabled` and
+`inverted` booleans, `amount`/`feather` in [0,1], normalized `start`/`end`
+points `{x,y}` in [0,1], `radius` in [.002,.4], `strokes`, and `adjustments`.
+The local grade contains eight required numbers: `exposure` [-3,3],
+`contrast`/`brightness` [-50,50], `saturation`/`temperature`/`tint`/
+`highlights`/`shadows` [-100,100]. No local curves or film parameter changes.
+The renderer ignores UI identity/name and rejects malformed render values.
+
+Coordinates refer to the complete rendered print (including a film gate if
+present), before final crop/rotation/flips. Linear coverage decreases from
+start to end, centered at their midpoint; feather spans the fraction of this
+distance. Radial start is the center and end sets ellipse radii, with minimum
+.005 per axis; feather is the soft fraction of each radius. Brush strokes
+store normalized `points` (1..1024), `radius` relative to the shorter print
+side, and boolean `erase`. Max 128 strokes/mask, 8192 points across all masks.
+Derived brush coverage uses a fixed 1024-pixel long edge, bilinearly sampled
+at every print pixel; addition uses max coverage, erasing min(coverage,1-stamp).
+It is independent of preview/export size. UI raster data is never serialized.
+
+After global Layer 2, each mask blends an encoded-ProPhoto local grade into
+the previous result, in list order, then the common geometry/output transform
+runs. Inversion precedes amount. Native GPU preview, navigator/histogram,
+proof and saved files therefore share the same local grade. Print cache and
+measured material data are unchanged. No AI segmentation; creation UI is for
+single photographs. Pair rendering can carry the frozen adjustments but the
+mask authoring controls are disabled in pair mode. Old Mac top-level `masks`
+remain unmodeled/preserved and are not reinterpreted as Studio masks.
+
+Regression: `engine/tests/host_local_masks.py` fails on the previous host
+(`local mask was ignored`) and covers all three shapes, erasing/inversion,
+inactive masks, crop+turn+flip, film/no-film, Post-Dev bypass, TIFF8/16 proof
+equality, private exports, bad requests and print-cache isolation.
